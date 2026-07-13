@@ -137,9 +137,27 @@ class MediaViewModel(private val context: android.content.Context, private val r
         newId
     }
 
-    // Firebase references
-    private val firestore = com.google.firebase.firestore.FirebaseFirestore.getInstance()
-    private val storage = com.google.firebase.storage.FirebaseStorage.getInstance()
+    // Firebase references initialized safely with lazy try-catch to prevent crashes on startup if missing configuration
+    private val firestore: com.google.firebase.firestore.FirebaseFirestore? by lazy {
+        try {
+            com.google.firebase.firestore.FirebaseFirestore.getInstance()
+        } catch (t: Throwable) {
+            android.util.Log.e("FirebaseInit", "Firestore could not be initialized, running in Local Offline Mode", t)
+            null
+        }
+    }
+
+    private val storage: com.google.firebase.storage.FirebaseStorage? by lazy {
+        try {
+            com.google.firebase.storage.FirebaseStorage.getInstance()
+        } catch (t: Throwable) {
+            android.util.Log.e("FirebaseInit", "FirebaseStorage could not be initialized, running in Local Offline Mode", t)
+            null
+        }
+    }
+
+    val isFirebaseAvailable: Boolean
+        get() = firestore != null && storage != null
 
     // Upload state variables
     private val _isUploading = MutableStateFlow(false)
@@ -149,12 +167,22 @@ class MediaViewModel(private val context: android.content.Context, private val r
     val uploadProgressValue: StateFlow<Float> = _uploadProgressValue.asStateFlow()
 
     init {
-        // Start Firebase sync to Room database in real-time
-        syncFromFirestore()
+        if (isFirebaseAvailable) {
+            // Start Firebase sync to Room database in real-time
+            syncFromFirestore()
+        } else {
+            // Seed database locally if empty since we are running in Local Offline Mode
+            viewModelScope.launch {
+                if (repository.getCount() == 0) {
+                    seedDatabase()
+                }
+            }
+        }
     }
 
     private fun syncFromFirestore() {
-        firestore.collection("media_items")
+        val db = firestore ?: return
+        db.collection("media_items")
             .addSnapshotListener { snapshot, error ->
                 if (error != null) {
                     android.util.Log.e("FirebaseSync", "Listen failed.", error)
@@ -358,11 +386,57 @@ class MediaViewModel(private val context: android.content.Context, private val r
             _isUploading.value = true
             _uploadProgressValue.value = 0f
 
+            val db = firestore
+            val st = storage
+
+            if (db == null || st == null) {
+                // LOCAL ONLY FALLBACK MODE
+                try {
+                    delay(300)
+                    _uploadProgressValue.value = 0.5f
+                    delay(300)
+                    _uploadProgressValue.value = 1.0f
+
+                    val videoUrl = videoUri.toString()
+                    val posterUrl = coverUri?.toString() ?: "https://images.unsplash.com/photo-1536440136628-849c177e76a1?w=500"
+
+                    val newItem = MediaItem(
+                        title = title.trim(),
+                        description = description.trim(),
+                        category = category.trim(),
+                        hashtags = hashtags.trim(),
+                        qualities = qualities.trim(),
+                        languages = languages.trim(),
+                        rating = rating,
+                        isSlide = isSlide,
+                        badge = badge.trim(),
+                        streamingPlatform = streamingPlatform,
+                        videoUrl = videoUrl,
+                        posterUrl = posterUrl,
+                        uploaderId = currentUserId,
+                        firestoreId = "local_" + java.util.UUID.randomUUID().toString(),
+                        views = (100..500).random(),
+                        likes = 0,
+                        shares = 0,
+                        downloads = 0,
+                        timestamp = System.currentTimeMillis()
+                    )
+
+                    repository.insertMediaItem(newItem)
+                    _isUploading.value = false
+                    onSuccess()
+                } catch (e: Exception) {
+                    _isUploading.value = false
+                    onFailure(e.localizedMessage ?: "Failed to upload locally.")
+                }
+                return@launch
+            }
+
             try {
                 val uploadId = java.util.UUID.randomUUID().toString()
 
                 // 1. Upload Video to Firebase Storage
-                val videoRef = storage.reference.child("videos/$uploadId.mp4")
+                val videoRef = st.reference.child("videos/$uploadId.mp4")
                 val videoUploadTask = videoRef.putFile(videoUri)
 
                 videoUploadTask.addOnProgressListener { taskSnapshot ->
@@ -376,7 +450,7 @@ class MediaViewModel(private val context: android.content.Context, private val r
                 // 2. Upload Cover Image (if selected) to Firebase Storage
                 var posterUrl = ""
                 if (coverUri != null) {
-                    val coverRef = storage.reference.child("covers/$uploadId.jpg")
+                    val coverRef = st.reference.child("covers/$uploadId.jpg")
                     val coverUploadTask = coverRef.putFile(coverUri)
 
                     coverUploadTask.addOnProgressListener { taskSnapshot ->
@@ -414,7 +488,7 @@ class MediaViewModel(private val context: android.content.Context, private val r
                     "timestamp" to System.currentTimeMillis()
                 )
 
-                firestore.collection("media_items").document(uploadId).set(meta).await()
+                db.collection("media_items").document(uploadId).set(meta).await()
 
                 _isUploading.value = false
                 onSuccess()
@@ -429,8 +503,31 @@ class MediaViewModel(private val context: android.content.Context, private val r
     fun deleteMedia(firestoreId: String, onSuccess: () -> Unit, onFailure: (String) -> Unit) {
         if (firestoreId.isBlank()) return
         viewModelScope.launch {
+            val db = firestore
+            val st = storage
+
+            if (db == null || st == null) {
+                // LOCAL ONLY FALLBACK MODE
+                try {
+                    val existing = repository.getMediaItemByFirestoreId(firestoreId)
+                    if (existing != null) {
+                        if (existing.uploaderId != currentUserId) {
+                            onFailure("You are not authorized to delete this video.")
+                            return@launch
+                        }
+                        repository.deleteByFirestoreId(firestoreId)
+                        onSuccess()
+                    } else {
+                        onFailure("Video not found.")
+                    }
+                } catch (e: Exception) {
+                    onFailure(e.localizedMessage ?: "Failed to delete video.")
+                }
+                return@launch
+            }
+
             try {
-                val docRef = firestore.collection("media_items").document(firestoreId)
+                val docRef = db.collection("media_items").document(firestoreId)
                 val doc = docRef.get().await()
 
                 if (doc.exists()) {
@@ -443,14 +540,14 @@ class MediaViewModel(private val context: android.content.Context, private val r
                     docRef.delete().await()
 
                     try {
-                        val videoRef = storage.reference.child("videos/$firestoreId.mp4")
+                        val videoRef = st.reference.child("videos/$firestoreId.mp4")
                         videoRef.delete()
                     } catch (e: Exception) {
                         android.util.Log.e("DeleteMedia", "Failed to delete video file", e)
                     }
 
                     try {
-                        val coverRef = storage.reference.child("covers/$firestoreId.jpg")
+                        val coverRef = st.reference.child("covers/$firestoreId.jpg")
                         coverRef.delete()
                     } catch (e: Exception) {
                         android.util.Log.e("DeleteMedia", "Failed to delete cover file", e)

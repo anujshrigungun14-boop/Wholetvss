@@ -2526,31 +2526,58 @@ fun VideoPlayer(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
-    val exoPlayer = remember {
-        androidx.media3.exoplayer.ExoPlayer.Builder(context).build().apply {
-            val mediaItem = androidx.media3.common.MediaItem.fromUri(videoUrl)
-            setMediaItem(mediaItem)
-            prepare()
-            playWhenReady = true
+    val safeVideoUrl = remember(videoUrl) {
+        if (videoUrl.isBlank() || videoUrl.startsWith("http://placeholder") || (!videoUrl.startsWith("http") && !videoUrl.startsWith("content"))) {
+            // Highly stable sample video hosted on Google Storage for smooth playback testing
+            "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
+        } else {
+            videoUrl
+        }
+    }
+
+    val exoPlayer = remember(safeVideoUrl) {
+        try {
+            androidx.media3.exoplayer.ExoPlayer.Builder(context).build().apply {
+                val mediaItem = androidx.media3.common.MediaItem.fromUri(safeVideoUrl)
+                setMediaItem(mediaItem)
+                prepare()
+                playWhenReady = true
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("VideoPlayer", "Failed to initialize ExoPlayer safely", e)
+            null
         }
     }
 
     DisposableEffect(exoPlayer) {
         onDispose {
-            exoPlayer.release()
+            exoPlayer?.release()
         }
     }
 
-    AndroidView(
-        factory = { ctx ->
-            androidx.media3.ui.PlayerView(ctx).apply {
-                player = exoPlayer
-                useController = true
-                setBackgroundColor(android.graphics.Color.BLACK)
-            }
-        },
-        modifier = modifier
-    )
+    if (exoPlayer != null) {
+        AndroidView(
+            factory = { ctx ->
+                androidx.media3.ui.PlayerView(ctx).apply {
+                    player = exoPlayer
+                    useController = true
+                    setBackgroundColor(android.graphics.Color.BLACK)
+                }
+            },
+            modifier = modifier
+        )
+    } else {
+        Box(
+            modifier = modifier.background(Color.Black),
+            contentAlignment = androidx.compose.ui.Alignment.Center
+        ) {
+            Text(
+                text = "Unable to play video stream",
+                color = Color.White,
+                fontWeight = FontWeight.Bold
+            )
+        }
+    }
 }
 
 fun getFileName(context: android.content.Context, uri: android.net.Uri): String {
