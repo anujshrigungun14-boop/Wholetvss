@@ -6,6 +6,10 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.*
@@ -66,7 +70,7 @@ class MainActivity : ComponentActivity() {
         // Build Database & Repository
         val database = AppDatabase.getDatabase(this)
         val repository = MediaRepository(database.mediaDao())
-        val factory = MediaViewModelFactory(repository)
+        val factory = MediaViewModelFactory(applicationContext, repository)
 
         setContent {
             MyApplicationTheme {
@@ -1373,6 +1377,7 @@ fun MediaDetailsDialog(
     val context = LocalContext.current
     var inputCommentName by remember { mutableStateOf("") }
     var inputCommentText by remember { mutableStateOf("") }
+    var isPlaying by remember { mutableStateOf(false) }
 
     val activeProgress = downloadProgress[media.id] ?: 0f
     val activeStatus = downloadStatus[media.id] ?: "None"
@@ -1426,63 +1431,109 @@ fun MediaDetailsDialog(
                     .fillMaxSize()
                     .verticalScroll(rememberScrollState())
             ) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(240.dp)
-                ) {
-                    if (media.posterUrl.isNotBlank()) {
-                        AsyncImage(
-                            model = media.posterUrl,
-                            contentDescription = media.title,
-                            contentScale = ContentScale.Crop,
+                if (isPlaying) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(240.dp)
+                            .background(Color.Black)
+                    ) {
+                        VideoPlayer(
+                            videoUrl = media.videoUrl.ifBlank { "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4" },
                             modifier = Modifier.fillMaxSize()
                         )
-                    } else {
+
+                        // Overlaid Close Player Button
+                        IconButton(
+                            onClick = { isPlaying = false },
+                            modifier = Modifier
+                                .padding(top = 40.dp, start = 16.dp)
+                                .background(Color.Black.copy(alpha = 0.5f), CircleShape)
+                                .align(Alignment.TopStart)
+                        ) {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                                contentDescription = "Close Player",
+                                tint = Color.White
+                            )
+                        }
+                    }
+                } else {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(240.dp)
+                    ) {
+                        if (media.posterUrl.isNotBlank()) {
+                            AsyncImage(
+                                model = media.posterUrl,
+                                contentDescription = media.title,
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier.fillMaxSize()
+                            )
+                        } else {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .background(
+                                        Brush.verticalGradient(
+                                            colors = listOf(DeepGrey, PremiumDarkBg)
+                                        )
+                                    ),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.Movie,
+                                    contentDescription = null,
+                                    tint = MovieRed,
+                                    modifier = Modifier.size(56.dp)
+                                )
+                            }
+                        }
+
+                        // Centered Play Button Overlay
+                        IconButton(
+                            onClick = { isPlaying = true },
+                            modifier = Modifier
+                                .size(64.dp)
+                                .background(MovieRed.copy(alpha = 0.9f), CircleShape)
+                                .align(Alignment.Center)
+                                .testTag("play_video_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.PlayArrow,
+                                contentDescription = "Play Video",
+                                tint = Color.White,
+                                modifier = Modifier.size(36.dp)
+                            )
+                        }
+
+                        // Shadow Gradient
                         Box(
                             modifier = Modifier
                                 .fillMaxSize()
                                 .background(
                                     Brush.verticalGradient(
-                                        colors = listOf(DeepGrey, PremiumDarkBg)
+                                        colors = listOf(Color.Transparent, PremiumDarkBg)
                                     )
-                                ),
-                            contentAlignment = Alignment.Center
+                                )
+                        )
+
+                        // Exit action
+                        IconButton(
+                            onClick = onDismiss,
+                            modifier = Modifier
+                                .padding(top = 40.dp, start = 16.dp)
+                                .background(Color.Black.copy(alpha = 0.5f), CircleShape)
+                                .align(Alignment.TopStart)
+                                .testTag("exit_detail_button")
                         ) {
                             Icon(
-                                imageVector = Icons.Filled.Movie,
-                                contentDescription = null,
-                                tint = MovieRed,
-                                modifier = Modifier.size(56.dp)
+                                imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                                contentDescription = "Back",
+                                tint = Color.White
                             )
                         }
-                    }
-
-                    // Shadow Gradient
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .background(
-                                Brush.verticalGradient(
-                                    colors = listOf(Color.Transparent, PremiumDarkBg)
-                                )
-                            )
-                    )
-
-                    // Exit action
-                    IconButton(
-                        onClick = onDismiss,
-                        modifier = Modifier
-                            .padding(top = 40.dp, start = 16.dp)
-                            .background(Color.Black.copy(alpha = 0.5f), CircleShape)
-                            .align(Alignment.TopStart)
-                            .testTag("exit_detail_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                            contentDescription = "Back",
-                            tint = Color.White
-                        )
                     }
                 }
 
@@ -1740,6 +1791,39 @@ fun MediaDetailsDialog(
                         }
                     }
 
+                    // Delete Button (only for uploader of this content)
+                    if (media.uploaderId == viewModel.currentUserId && media.firestoreId.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Button(
+                            onClick = {
+                                viewModel.deleteMedia(
+                                    firestoreId = media.firestoreId,
+                                    onSuccess = {
+                                        Toast.makeText(context, "🗑️ Video deleted successfully!", Toast.LENGTH_SHORT).show()
+                                        onDismiss()
+                                    },
+                                    onFailure = { err ->
+                                        Toast.makeText(context, "Failed to delete: $err", Toast.LENGTH_LONG).show()
+                                    }
+                                )
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFC62828)),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(48.dp)
+                                .testTag("delete_media_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.Delete,
+                                contentDescription = "Delete Video",
+                                tint = Color.White
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("Delete Uploaded Video", fontWeight = FontWeight.Bold, color = Color.White)
+                        }
+                    }
+
                     Spacer(modifier = Modifier.height(16.dp))
 
                     // More Like This (Recommendations) Section
@@ -1918,6 +2002,28 @@ fun UploadDialog(
     var isSlide by remember { mutableStateOf(false) }
     var platform by remember { mutableStateOf("None") }
 
+    var selectedVideoUri by remember { mutableStateOf<android.net.Uri?>(null) }
+    var selectedCoverUri by remember { mutableStateOf<android.net.Uri?>(null) }
+    var videoName by remember { mutableStateOf("") }
+    var coverName by remember { mutableStateOf("") }
+
+    val videoPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri: android.net.Uri? ->
+        selectedVideoUri = uri
+        videoName = uri?.let { getFileName(context, it) } ?: ""
+    }
+
+    val coverPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickVisualMedia()
+    ) { uri: android.net.Uri? ->
+        selectedCoverUri = uri
+        coverName = uri?.let { getFileName(context, it) } ?: ""
+    }
+
+    val isUploading by viewModel.isUploading.collectAsStateWithLifecycle()
+    val uploadProgress by viewModel.uploadProgressValue.collectAsStateWithLifecycle()
+
     val existingCategories by viewModel.categories.collectAsStateWithLifecycle()
     val dynamicCategoriesList = remember(existingCategories) {
         existingCategories.filter { it != "Recommend" }
@@ -1925,10 +2031,10 @@ fun UploadDialog(
     val platformsList = listOf("None", "Netflix", "Disney+", "Prime Video")
 
     Dialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = { if (!isUploading) onDismiss() },
         properties = DialogProperties(
-            dismissOnBackPress = true,
-            dismissOnClickOutside = true,
+            dismissOnBackPress = !isUploading,
+            dismissOnClickOutside = !isUploading,
             usePlatformDefaultWidth = false
         )
     ) {
@@ -1951,7 +2057,7 @@ fun UploadDialog(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     IconButton(
-                        onClick = onDismiss,
+                        onClick = { if (!isUploading) onDismiss() },
                         modifier = Modifier.testTag("upload_back_button")
                     ) {
                         Icon(
@@ -1981,7 +2087,7 @@ fun UploadDialog(
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     Text(
-                        text = "Mix shows, series, and reality uploads inside wholeTV instantly in real-time.",
+                        text = "Upload custom videos and cover artwork directly into the wholeTV database.",
                         color = MutedSlate,
                         fontSize = 13.sp
                     )
@@ -2017,6 +2123,88 @@ fun UploadDialog(
                         maxLines = 4,
                         modifier = Modifier.fillMaxWidth().testTag("upload_desc_field")
                     )
+
+                    // VIDEO FILE PICKER CARD
+                    Text(text = "Select Video File *", color = SoftWhite, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { if (!isUploading) videoPickerLauncher.launch("video/*") },
+                        colors = CardDefaults.cardColors(containerColor = DarkSurface),
+                        border = BorderStroke(1.dp, if (selectedVideoUri != null) MovieRed else DeepGrey)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(16.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = if (selectedVideoUri != null) Icons.Filled.CheckCircle else Icons.Filled.VideoFile,
+                                contentDescription = null,
+                                tint = if (selectedVideoUri != null) Color(0xFF2E7D32) else MovieRed,
+                                modifier = Modifier.size(32.dp)
+                            )
+                            Spacer(modifier = Modifier.width(16.dp))
+                            Column {
+                                Text(
+                                    text = if (videoName.isNotEmpty()) videoName else "Tap to Choose Video",
+                                    color = SoftWhite,
+                                    fontSize = 14.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    text = if (selectedVideoUri != null) "Video selected from device" else "Supports MP4, MKV, 3GP",
+                                    color = MutedSlate,
+                                    fontSize = 11.sp
+                                )
+                            }
+                        }
+                    }
+
+                    // COVER IMAGE PICKER CARD
+                    Text(text = "Select Cover Image (Optional)", color = SoftWhite, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                if (!isUploading) {
+                                    coverPickerLauncher.launch(
+                                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                    )
+                                }
+                            },
+                        colors = CardDefaults.cardColors(containerColor = DarkSurface),
+                        border = BorderStroke(1.dp, if (selectedCoverUri != null) MovieRed else DeepGrey)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(16.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = if (selectedCoverUri != null) Icons.Filled.CheckCircle else Icons.Filled.Image,
+                                contentDescription = null,
+                                tint = if (selectedCoverUri != null) Color(0xFF2E7D32) else MovieRed,
+                                modifier = Modifier.size(32.dp)
+                            )
+                            Spacer(modifier = Modifier.width(16.dp))
+                            Column {
+                                Text(
+                                    text = if (coverName.isNotEmpty()) coverName else "Tap to Choose Cover Image",
+                                    color = SoftWhite,
+                                    fontSize = 14.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    text = if (selectedCoverUri != null) "Cover selected from device" else "Supports JPG, PNG, WEBP",
+                                    color = MutedSlate,
+                                    fontSize = 11.sp
+                                )
+                            }
+                        }
+                    }
 
                     // Custom Category Input TextField
                     OutlinedTextField(
@@ -2205,6 +2393,8 @@ fun UploadDialog(
                             val finalCategory = categoryInput.trim().ifBlank { "Movies" }
                             if (title.isBlank() || description.isBlank()) {
                                 Toast.makeText(context, "Please fill out required title and description fields.", Toast.LENGTH_SHORT).show()
+                            } else if (selectedVideoUri == null) {
+                                Toast.makeText(context, "Please select a video file to upload.", Toast.LENGTH_SHORT).show()
                             } else {
                                 viewModel.uploadMedia(
                                     title = title,
@@ -2216,10 +2406,17 @@ fun UploadDialog(
                                     rating = r,
                                     isSlide = isSlide,
                                     badge = badge,
-                                    streamingPlatform = platform
+                                    streamingPlatform = platform,
+                                    videoUri = selectedVideoUri,
+                                    coverUri = selectedCoverUri,
+                                    onSuccess = {
+                                        Toast.makeText(context, "🚀 Video uploaded successfully into wholeTV database!", Toast.LENGTH_LONG).show()
+                                        onDismiss()
+                                    },
+                                    onFailure = { error ->
+                                        Toast.makeText(context, "❌ Upload failed: $error", Toast.LENGTH_LONG).show()
+                                    }
                                 )
-                                Toast.makeText(context, "🚀 Show uploaded successfully into wholeTV database!", Toast.LENGTH_LONG).show()
-                                onDismiss()
                             }
                         },
                         colors = ButtonDefaults.buttonColors(containerColor = MovieRed),
@@ -2235,6 +2432,42 @@ fun UploadDialog(
                     }
 
                     Spacer(modifier = Modifier.height(60.dp))
+                }
+            }
+
+            // Real-time circular progress indicator overlay dialog when uploading
+            if (isUploading) {
+                Dialog(onDismissRequest = {}) {
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = DarkSurface),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.padding(24.dp)
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(24.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            CircularProgressIndicator(
+                                progress = { uploadProgress },
+                                color = MovieRed,
+                                trackColor = DeepGrey
+                            )
+                            Spacer(modifier = Modifier.height(16.dp))
+                            Text(
+                                text = "Uploading to Cloud...",
+                                color = SoftWhite,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 16.sp
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "${(uploadProgress * 100).toInt()}% Complete",
+                                color = CinemaGold,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -2285,4 +2518,62 @@ fun formatCount(count: Int): String {
         count >= 1_000 -> String.format("%.1fK", count / 1_000f)
         else -> count.toString()
     }
+}
+
+@Composable
+fun VideoPlayer(
+    videoUrl: String,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    val exoPlayer = remember {
+        androidx.media3.exoplayer.ExoPlayer.Builder(context).build().apply {
+            val mediaItem = androidx.media3.common.MediaItem.fromUri(videoUrl)
+            setMediaItem(mediaItem)
+            prepare()
+            playWhenReady = true
+        }
+    }
+
+    DisposableEffect(exoPlayer) {
+        onDispose {
+            exoPlayer.release()
+        }
+    }
+
+    AndroidView(
+        factory = { ctx ->
+            androidx.media3.ui.PlayerView(ctx).apply {
+                player = exoPlayer
+                useController = true
+                setBackgroundColor(android.graphics.Color.BLACK)
+            }
+        },
+        modifier = modifier
+    )
+}
+
+fun getFileName(context: android.content.Context, uri: android.net.Uri): String {
+    var result: String? = null
+    if (uri.scheme == "content") {
+        val cursor = context.contentResolver.query(uri, null, null, null, null)
+        try {
+            if (cursor != null && cursor.moveToFirst()) {
+                val index = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                if (index != -1) {
+                    result = cursor.getString(index)
+                }
+            }
+        } finally {
+            cursor?.close()
+        }
+    }
+    if (result == null) {
+        result = uri.path
+        val cut = result?.lastIndexOf('/') ?: -1
+        if (cut != -1) {
+            result = result?.substring(cut + 1)
+        }
+    }
+    return result ?: "Unknown file"
 }

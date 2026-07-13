@@ -30,6 +30,14 @@ class MediaRepository(private val mediaDao: MediaDao) {
         return mediaDao.insertMediaItem(item)
     }
 
+    suspend fun deleteByFirestoreId(firestoreId: String) {
+        mediaDao.deleteByFirestoreId(firestoreId)
+    }
+
+    suspend fun getMediaItemByFirestoreId(firestoreId: String): MediaItem? {
+        return mediaDao.getMediaItemByFirestoreId(firestoreId)
+    }
+
     suspend fun insertComment(comment: Comment) {
         mediaDao.insertComment(comment)
     }

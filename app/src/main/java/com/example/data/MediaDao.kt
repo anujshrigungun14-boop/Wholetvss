@@ -32,6 +32,12 @@ interface MediaDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertMediaItem(item: MediaItem): Long
 
+    @Query("DELETE FROM media_items WHERE firestoreId = :firestoreId")
+    suspend fun deleteByFirestoreId(firestoreId: String)
+
+    @Query("SELECT * FROM media_items WHERE firestoreId = :firestoreId LIMIT 1")
+    suspend fun getMediaItemByFirestoreId(firestoreId: String): MediaItem?
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertComment(comment: Comment)
 

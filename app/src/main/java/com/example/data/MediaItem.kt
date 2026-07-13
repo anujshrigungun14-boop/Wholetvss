@@ -21,5 +21,8 @@ data class MediaItem(
     val shares: Int = 0,
     val downloads: Int = 0,
     val streamingPlatform: String = "None", // "Netflix", "Disney+", "Prime Video", "None"
+    val videoUrl: String = "",
+    val firestoreId: String = "",
+    val uploaderId: String = "",
     val timestamp: Long = System.currentTimeMillis()
 )

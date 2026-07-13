@@ -10,8 +10,9 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.tasks.await
 
-class MediaViewModel(private val repository: MediaRepository) : ViewModel() {
+class MediaViewModel(private val context: android.content.Context, private val repository: MediaRepository) : ViewModel() {
 
     // Bottom Tab navigation: "Home", "Streaming", "Categories", "Promotion", "Me"
     private val _currentTab = MutableStateFlow("Home")
@@ -128,16 +129,125 @@ class MediaViewModel(private val repository: MediaRepository) : ViewModel() {
     private val _downloadStatus = MutableStateFlow<Map<Int, String>>(emptyMap())
     val downloadStatus: StateFlow<Map<Int, String>> = _downloadStatus.asStateFlow()
 
+    // Persistent User Identity using SharedPreferences
+    private val sharedPrefs = context.getSharedPreferences("wholetv_prefs", android.content.Context.MODE_PRIVATE)
+    val currentUserId: String = sharedPrefs.getString("user_id", null) ?: run {
+        val newId = java.util.UUID.randomUUID().toString()
+        sharedPrefs.edit().putString("user_id", newId).apply()
+        newId
+    }
+
+    // Firebase references
+    private val firestore = com.google.firebase.firestore.FirebaseFirestore.getInstance()
+    private val storage = com.google.firebase.storage.FirebaseStorage.getInstance()
+
+    // Upload state variables
+    private val _isUploading = MutableStateFlow(false)
+    val isUploading: StateFlow<Boolean> = _isUploading.asStateFlow()
+
+    private val _uploadProgressValue = MutableStateFlow(0f)
+    val uploadProgressValue: StateFlow<Float> = _uploadProgressValue.asStateFlow()
+
     init {
-        // Run seed check
-        viewModelScope.launch {
-            // Seeding disabled to remove all fake/demo content and support purely real, user-driven catalog
-            /*
-            if (repository.getCount() == 0) {
-                seedDatabase()
+        // Start Firebase sync to Room database in real-time
+        syncFromFirestore()
+    }
+
+    private fun syncFromFirestore() {
+        firestore.collection("media_items")
+            .addSnapshotListener { snapshot, error ->
+                if (error != null) {
+                    android.util.Log.e("FirebaseSync", "Listen failed.", error)
+                    return@addSnapshotListener
+                }
+
+                if (snapshot != null) {
+                    viewModelScope.launch {
+                        val snapshotDocIds = snapshot.documents.map { it.id }.toSet()
+
+                        for (doc in snapshot.documents) {
+                            try {
+                                val docId = doc.id
+                                val title = doc.getString("title") ?: ""
+                                val description = doc.getString("description") ?: ""
+                                val category = doc.getString("category") ?: "Movies"
+                                val hashtags = doc.getString("hashtags") ?: ""
+                                val qualities = doc.getString("qualities") ?: "1080p HD"
+                                val languages = doc.getString("languages") ?: "English"
+                                val posterUrl = doc.getString("posterUrl") ?: ""
+                                val videoUrl = doc.getString("videoUrl") ?: ""
+                                val uploaderId = doc.getString("uploaderId") ?: ""
+                                val rating = doc.getDouble("rating") ?: 8.5
+                                val isSlide = doc.getBoolean("isSlide") ?: false
+                                val badge = doc.getString("badge") ?: ""
+                                val views = doc.getLong("views")?.toInt() ?: 0
+                                val likes = doc.getLong("likes")?.toInt() ?: 0
+                                val shares = doc.getLong("shares")?.toInt() ?: 0
+                                val downloads = doc.getLong("downloads")?.toInt() ?: 0
+                                val streamingPlatform = doc.getString("streamingPlatform") ?: "None"
+                                val timestamp = doc.getLong("timestamp") ?: System.currentTimeMillis()
+
+                                val existing = repository.getMediaItemByFirestoreId(docId)
+                                if (existing != null) {
+                                    val updated = existing.copy(
+                                        title = title,
+                                        description = description,
+                                        category = category,
+                                        hashtags = hashtags,
+                                        qualities = qualities,
+                                        languages = languages,
+                                        posterUrl = posterUrl,
+                                        videoUrl = videoUrl,
+                                        uploaderId = uploaderId,
+                                        rating = rating,
+                                        isSlide = isSlide,
+                                        badge = badge,
+                                        views = views,
+                                        likes = likes,
+                                        shares = shares,
+                                        downloads = downloads,
+                                        streamingPlatform = streamingPlatform,
+                                        timestamp = timestamp
+                                    )
+                                    repository.insertMediaItem(updated)
+                                } else {
+                                    val newItem = MediaItem(
+                                        title = title,
+                                        description = description,
+                                        category = category,
+                                        hashtags = hashtags,
+                                        qualities = qualities,
+                                        languages = languages,
+                                        posterUrl = posterUrl,
+                                        videoUrl = videoUrl,
+                                        uploaderId = uploaderId,
+                                        rating = rating,
+                                        isSlide = isSlide,
+                                        badge = badge,
+                                        views = views,
+                                        likes = likes,
+                                        shares = shares,
+                                        downloads = downloads,
+                                        streamingPlatform = streamingPlatform,
+                                        firestoreId = docId,
+                                        timestamp = timestamp
+                                    )
+                                    repository.insertMediaItem(newItem)
+                                }
+                            } catch (e: Exception) {
+                                android.util.Log.e("FirebaseSync", "Error parsing doc: ${doc.id}", e)
+                            }
+                        }
+
+                        val allLocalItems = repository.allMediaItems.firstOrNull() ?: emptyList()
+                        for (localItem in allLocalItems) {
+                            if (localItem.firestoreId.isNotEmpty() && !snapshotDocIds.contains(localItem.firestoreId)) {
+                                repository.deleteByFirestoreId(localItem.firestoreId)
+                            }
+                        }
+                    }
+                }
             }
-            */
-        }
     }
 
     fun setTab(tab: String) {
@@ -233,35 +343,127 @@ class MediaViewModel(private val repository: MediaRepository) : ViewModel() {
         rating: Double,
         isSlide: Boolean,
         badge: String,
-        streamingPlatform: String
+        streamingPlatform: String,
+        videoUri: android.net.Uri?,
+        coverUri: android.net.Uri?,
+        onSuccess: () -> Unit,
+        onFailure: (String) -> Unit
     ) {
+        if (videoUri == null) {
+            onFailure("Please select a video file.")
+            return
+        }
+
         viewModelScope.launch {
-            val newItem = MediaItem(
-                title = title.trim(),
-                description = description.trim(),
-                category = category,
-                hashtags = hashtags.trim(),
-                qualities = qualities.trim(),
-                languages = languages.trim(),
-                rating = rating,
-                isSlide = isSlide,
-                badge = badge.trim(),
-                streamingPlatform = streamingPlatform,
-                views = (1000..15000).random(),
-                likes = (100..2000).random(),
-                shares = (10..500).random(),
-                downloads = (50..3000).random()
-            )
-            val insertedId = repository.insertMediaItem(newItem)
-            
-            // Add initial welcome comment for newly uploaded content
-            repository.insertComment(
-                Comment(
-                    mediaItemId = insertedId.toInt(),
-                    userName = "wholeTV Moderator",
-                    text = "Welcome! This is newly uploaded under the Legendary Fast Upload System. Feel free to download at max speed and comment!"
+            _isUploading.value = true
+            _uploadProgressValue.value = 0f
+
+            try {
+                val uploadId = java.util.UUID.randomUUID().toString()
+
+                // 1. Upload Video to Firebase Storage
+                val videoRef = storage.reference.child("videos/$uploadId.mp4")
+                val videoUploadTask = videoRef.putFile(videoUri)
+
+                videoUploadTask.addOnProgressListener { taskSnapshot ->
+                    val progress = (taskSnapshot.bytesTransferred.toFloat() / taskSnapshot.totalByteCount.toFloat()) * 0.8f
+                    _uploadProgressValue.value = progress
+                }
+
+                val videoSnapshot = videoUploadTask.await()
+                val videoUrl = videoSnapshot.metadata!!.reference!!.downloadUrl.await().toString()
+
+                // 2. Upload Cover Image (if selected) to Firebase Storage
+                var posterUrl = ""
+                if (coverUri != null) {
+                    val coverRef = storage.reference.child("covers/$uploadId.jpg")
+                    val coverUploadTask = coverRef.putFile(coverUri)
+
+                    coverUploadTask.addOnProgressListener { taskSnapshot ->
+                        val progress = 0.8f + ((taskSnapshot.bytesTransferred.toFloat() / taskSnapshot.totalByteCount.toFloat()) * 0.2f)
+                        _uploadProgressValue.value = progress
+                    }
+
+                    val coverSnapshot = coverUploadTask.await()
+                    posterUrl = coverSnapshot.metadata!!.reference!!.downloadUrl.await().toString()
+                } else {
+                    posterUrl = "https://images.unsplash.com/photo-1536440136628-849c177e76a1?w=500"
+                }
+
+                _uploadProgressValue.value = 1.0f
+
+                // 3. Save Metadata to Cloud Firestore
+                val meta = hashMapOf(
+                    "title" to title.trim(),
+                    "description" to description.trim(),
+                    "category" to category.trim(),
+                    "hashtags" to hashtags.trim(),
+                    "qualities" to qualities.trim(),
+                    "languages" to languages.trim(),
+                    "rating" to rating,
+                    "isSlide" to isSlide,
+                    "badge" to badge.trim(),
+                    "streamingPlatform" to streamingPlatform,
+                    "videoUrl" to videoUrl,
+                    "posterUrl" to posterUrl,
+                    "uploaderId" to currentUserId,
+                    "views" to (100..500).random(),
+                    "likes" to 0,
+                    "shares" to 0,
+                    "downloads" to 0,
+                    "timestamp" to System.currentTimeMillis()
                 )
-            )
+
+                firestore.collection("media_items").document(uploadId).set(meta).await()
+
+                _isUploading.value = false
+                onSuccess()
+            } catch (e: Exception) {
+                _isUploading.value = false
+                android.util.Log.e("UploadMedia", "Failed to upload", e)
+                onFailure(e.localizedMessage ?: "Unknown error occurred")
+            }
+        }
+    }
+
+    fun deleteMedia(firestoreId: String, onSuccess: () -> Unit, onFailure: (String) -> Unit) {
+        if (firestoreId.isBlank()) return
+        viewModelScope.launch {
+            try {
+                val docRef = firestore.collection("media_items").document(firestoreId)
+                val doc = docRef.get().await()
+
+                if (doc.exists()) {
+                    val uploader = doc.getString("uploaderId") ?: ""
+                    if (uploader != currentUserId) {
+                        onFailure("You are not authorized to delete this video.")
+                        return@launch
+                    }
+
+                    docRef.delete().await()
+
+                    try {
+                        val videoRef = storage.reference.child("videos/$firestoreId.mp4")
+                        videoRef.delete()
+                    } catch (e: Exception) {
+                        android.util.Log.e("DeleteMedia", "Failed to delete video file", e)
+                    }
+
+                    try {
+                        val coverRef = storage.reference.child("covers/$firestoreId.jpg")
+                        coverRef.delete()
+                    } catch (e: Exception) {
+                        android.util.Log.e("DeleteMedia", "Failed to delete cover file", e)
+                    }
+
+                    onSuccess()
+                } else {
+                    onFailure("Video not found.")
+                }
+            } catch (e: Exception) {
+                android.util.Log.e("DeleteMedia", "Failed to delete", e)
+                onFailure(e.localizedMessage ?: "Failed to delete video.")
+            }
         }
     }
 
@@ -484,11 +686,11 @@ class MediaViewModel(private val repository: MediaRepository) : ViewModel() {
     }
 }
 
-class MediaViewModelFactory(private val repository: MediaRepository) : ViewModelProvider.Factory {
+class MediaViewModelFactory(private val context: android.content.Context, private val repository: MediaRepository) : ViewModelProvider.Factory {
     override fun <T : ViewModel> create(modelClass: Class<T>): T {
         if (modelClass.isAssignableFrom(MediaViewModel::class.java)) {
             @Suppress("UNCHECKED_CAST")
-            return MediaViewModel(repository) as T
+            return MediaViewModel(context, repository) as T
         }
         throw IllegalArgumentException("Unknown ViewModel class")
     }
