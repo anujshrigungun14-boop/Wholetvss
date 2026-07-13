@@ -27,6 +27,15 @@ jobs:
         with:
           gradle-version: '9.3.1'
 
+      - name: Recreate Debug Keystore
+        run: |
+          if [ -f "debug.keystore.base64" ]; then
+            echo "Decoding debug.keystore.base64 to debug.keystore..."
+            base64 -d debug.keystore.base64 > debug.keystore
+          else
+            echo "Warning: debug.keystore.base64 not found!"
+          fi
+
       - name: Generate Gradle Wrapper (if missing)
         run: |
           if [ ! -f "gradlew" ]; then
