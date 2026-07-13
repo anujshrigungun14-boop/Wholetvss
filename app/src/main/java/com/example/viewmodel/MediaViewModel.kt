@@ -13,10 +13,13 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.RandomAccessFile
 import java.net.HttpURLConnection
 import java.net.URL
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.RequestBody.Companion.asRequestBody
 
 class MediaViewModel(private val context: android.content.Context, private val repository: MediaRepository) : ViewModel() {
 
@@ -275,48 +278,54 @@ class MediaViewModel(private val context: android.content.Context, private val r
     private val _userUsername = MutableStateFlow(sharedPrefs.getString("user_username", "@streamer") ?: "")
     val userUsername: StateFlow<String> = _userUsername.asStateFlow()
 
+    private fun getFileFromUri(context: android.content.Context, uri: android.net.Uri): File? {
+        return try {
+            val contentResolver = context.contentResolver
+            val mimeType = contentResolver.getType(uri) ?: "video/mp4"
+            val extension = when {
+                mimeType.contains("video/mp4") -> "mp4"
+                mimeType.contains("video/mkv") -> "mkv"
+                mimeType.contains("video/webm") -> "webm"
+                mimeType.contains("image/jpeg") -> "jpg"
+                mimeType.contains("image/jpg") -> "jpg"
+                mimeType.contains("image/png") -> "png"
+                else -> "bin"
+            }
+            val tempFile = File(context.cacheDir, "upload_temp_${System.currentTimeMillis()}.$extension")
+            contentResolver.openInputStream(uri)?.use { inputStream ->
+                tempFile.outputStream().use { outputStream ->
+                    inputStream.copyTo(outputStream)
+                }
+            }
+            if (tempFile.exists() && tempFile.length() > 0) {
+                tempFile
+            } else {
+                null
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("UploadMedia", "Failed to copy URI to temp file", e)
+            null
+        }
+    }
+
     fun updateUserProfile(displayName: String, username: String, bio: String, onSuccess: () -> Unit, onFailure: (String) -> Unit) {
         val u = auth?.currentUser
-        if (u == null) {
-            // Local mode fallback
-            sharedPrefs.edit()
-                .putString("user_display_name", displayName)
-                .putString("user_username", username)
-                .putString("user_bio", bio)
-                .apply()
-            _userBio.value = bio
-            _userUsername.value = username
-            onSuccess()
-            return
-        }
-
         viewModelScope.launch {
             try {
-                // 1. Update Display Name in Firebase Auth
-                val updates = com.google.firebase.auth.userProfileChangeRequest {
-                    this.displayName = displayName
+                if (u != null) {
+                    val updates = com.google.firebase.auth.userProfileChangeRequest {
+                        this.displayName = displayName
+                    }
+                    u.updateProfile(updates).await()
                 }
-                u.updateProfile(updates).await()
 
-                // 2. Save username and bio in Firestore and SharedPreferences
                 sharedPrefs.edit()
+                    .putString("user_display_name", displayName)
                     .putString("user_username", username)
                     .putString("user_bio", bio)
                     .apply()
                 _userBio.value = bio
                 _userUsername.value = username
-
-                val db = firestore
-                if (db != null) {
-                    val userMeta = hashMapOf(
-                        "displayName" to displayName,
-                        "username" to username,
-                        "bio" to bio,
-                        "email" to (u.email ?: "")
-                    )
-                    db.collection("users").document(u.uid).set(userMeta).await()
-                }
-
                 onSuccess()
             } catch (e: Exception) {
                 onFailure(e.localizedMessage ?: "Failed to update user profile.")
@@ -326,35 +335,47 @@ class MediaViewModel(private val context: android.content.Context, private val r
 
     fun uploadProfilePicture(uri: android.net.Uri, onSuccess: (String) -> Unit, onFailure: (String) -> Unit) {
         val u = auth?.currentUser
-        val st = storage
-        if (u == null || st == null) {
-            // Local fallback
-            sharedPrefs.edit().putString("user_photo_url", uri.toString()).apply()
-            onSuccess(uri.toString())
-            return
-        }
-
         viewModelScope.launch {
             try {
-                val ref = st.reference.child("profiles/${u.uid}.jpg")
-                val uploadTask = ref.putFile(uri)
-                uploadTask.await()
-                
-                val downloadUrl = ref.downloadUrl.await().toString()
-                
-                val updates = com.google.firebase.auth.userProfileChangeRequest {
-                    this.photoUri = android.net.Uri.parse(downloadUrl)
+                val imageFile = getFileFromUri(context, uri)
+                if (imageFile == null || !imageFile.exists() || !imageFile.canRead()) {
+                    onFailure("Failed to access or read the selected image file.")
+                    return@launch
                 }
-                u.updateProfile(updates).await()
+                val mimeType = context.contentResolver.getType(uri) ?: "image/jpeg"
+                val okHttpClient = okhttp3.OkHttpClient.Builder()
+                    .connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                    .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                    .build()
+                val requestBody = okhttp3.MultipartBody.Builder()
+                    .setType(okhttp3.MultipartBody.FORM)
+                    .addFormDataPart("file", imageFile.name, imageFile.asRequestBody(mimeType.toMediaTypeOrNull()))
+                    .addFormDataPart("upload_preset", "wholetv_upload")
+                    .build()
+                val request = okhttp3.Request.Builder()
+                    .url("https://api.cloudinary.com/v1_1/wholetv/image/upload")
+                    .post(requestBody)
+                    .build()
+                val response = withContext(Dispatchers.IO) { okHttpClient.newCall(request).execute() }
+                if (!response.isSuccessful) {
+                    val errorMsg = response.body?.string() ?: "Unknown error"
+                    onFailure("Cloudinary upload failed: $errorMsg")
+                    imageFile.delete()
+                    return@launch
+                }
+                val resBody = response.body?.string() ?: ""
+                val json = org.json.JSONObject(resBody)
+                val downloadUrl = json.getString("secure_url")
+                imageFile.delete()
+
+                if (u != null) {
+                    val updates = com.google.firebase.auth.userProfileChangeRequest {
+                        this.photoUri = android.net.Uri.parse(downloadUrl)
+                    }
+                    u.updateProfile(updates).await()
+                }
                 
                 sharedPrefs.edit().putString("user_photo_url", downloadUrl).apply()
-                
-                // Sync to user doc in Firestore
-                val db = firestore
-                if (db != null) {
-                    db.collection("users").document(u.uid).update("photoUrl", downloadUrl).await()
-                }
-
                 onSuccess(downloadUrl)
             } catch (e: Exception) {
                 onFailure(e.localizedMessage ?: "Failed to upload profile image.")
@@ -369,41 +390,9 @@ class MediaViewModel(private val context: android.content.Context, private val r
             if (media != null) {
                 val updated = media.copy(watchTime = media.watchTime + seconds)
                 repository.insertMediaItem(updated)
-
-                val db = firestore
-                if (media.firestoreId.isNotEmpty() && db != null) {
-                    try {
-                        db.collection("media_items").document(media.firestoreId)
-                            .update("watchTime", com.google.firebase.firestore.FieldValue.increment(seconds))
-                    } catch (e: Exception) {
-                        android.util.Log.e("WatchTime", "Failed to increment watchTime in Firestore", e)
-                    }
-                }
             }
         }
     }
-
-    // Firebase references initialized safely with lazy try-catch to prevent crashes on startup if missing configuration
-    private val firestore: com.google.firebase.firestore.FirebaseFirestore? by lazy {
-        try {
-            com.google.firebase.firestore.FirebaseFirestore.getInstance()
-        } catch (t: Throwable) {
-            android.util.Log.e("FirebaseInit", "Firestore could not be initialized, running in Local Offline Mode", t)
-            null
-        }
-    }
-
-    private val storage: com.google.firebase.storage.FirebaseStorage? by lazy {
-        try {
-            com.google.firebase.storage.FirebaseStorage.getInstance()
-        } catch (t: Throwable) {
-            android.util.Log.e("FirebaseInit", "FirebaseStorage could not be initialized, running in Local Offline Mode", t)
-            null
-        }
-    }
-
-    val isFirebaseAvailable: Boolean
-        get() = firestore != null && storage != null
 
     // Upload state variables
     private val _isUploading = MutableStateFlow(false)
@@ -413,124 +402,12 @@ class MediaViewModel(private val context: android.content.Context, private val r
     val uploadProgressValue: StateFlow<Float> = _uploadProgressValue.asStateFlow()
 
     init {
-        if (isFirebaseAvailable) {
-            // Start Firebase sync to Room database in real-time
-            syncFromFirestore()
-        } else {
-            // Seed database locally if empty since we are running in Local Offline Mode
-            viewModelScope.launch {
-                if (repository.getCount() == 0) {
-                    seedDatabase()
-                }
+        // Seed database locally if empty
+        viewModelScope.launch {
+            if (repository.getCount() == 0) {
+                seedDatabase()
             }
         }
-    }
-
-    private fun syncFromFirestore() {
-        val db = firestore ?: return
-        db.collection("media_items")
-            .addSnapshotListener { snapshot, error ->
-                if (error != null) {
-                    android.util.Log.e("FirebaseSync", "Listen failed.", error)
-                    return@addSnapshotListener
-                }
-
-                if (snapshot != null) {
-                    viewModelScope.launch {
-                        val snapshotDocIds = snapshot.documents.map { it.id }.toSet()
-
-                        for (doc in snapshot.documents) {
-                            try {
-                                val docId = doc.id
-                                val title = doc.getString("title") ?: ""
-                                val description = doc.getString("description") ?: ""
-                                val category = doc.getString("category") ?: "Movies"
-                                val hashtags = doc.getString("hashtags") ?: ""
-                                val qualities = doc.getString("qualities") ?: "1080p HD"
-                                val languages = doc.getString("languages") ?: "English"
-                                val posterUrl = doc.getString("posterUrl") ?: ""
-                                val videoUrl = doc.getString("videoUrl") ?: ""
-                                val uploaderId = doc.getString("uploaderId") ?: ""
-                                val rating = doc.getDouble("rating") ?: 8.5
-                                val isSlide = doc.getBoolean("isSlide") ?: false
-                                val badge = doc.getString("badge") ?: ""
-                                val views = doc.getLong("views")?.toInt() ?: 0
-                                val likes = doc.getLong("likes")?.toInt() ?: 0
-                                val shares = doc.getLong("shares")?.toInt() ?: 0
-                                val downloads = doc.getLong("downloads")?.toInt() ?: 0
-                                val streamingPlatform = doc.getString("streamingPlatform") ?: "None"
-                                val timestamp = doc.getLong("timestamp") ?: System.currentTimeMillis()
-                                val genre = doc.getString("genre") ?: "Action"
-                                val uploaderName = doc.getString("uploaderName") ?: "Anonymous"
-                                val watchTime = doc.getLong("watchTime") ?: 0L
-
-                                val existing = repository.getMediaItemByFirestoreId(docId)
-                                if (existing != null) {
-                                    val updated = existing.copy(
-                                        title = title,
-                                        description = description,
-                                        category = category,
-                                        hashtags = hashtags,
-                                        qualities = qualities,
-                                        languages = languages,
-                                        posterUrl = posterUrl,
-                                        videoUrl = videoUrl,
-                                        uploaderId = uploaderId,
-                                        rating = rating,
-                                        isSlide = isSlide,
-                                        badge = badge,
-                                        views = views,
-                                        likes = likes,
-                                        shares = shares,
-                                        downloads = downloads,
-                                        streamingPlatform = streamingPlatform,
-                                        timestamp = timestamp,
-                                        genre = genre,
-                                        uploaderName = uploaderName,
-                                        watchTime = watchTime
-                                    )
-                                    repository.insertMediaItem(updated)
-                                } else {
-                                    val newItem = MediaItem(
-                                        title = title,
-                                        description = description,
-                                        category = category,
-                                        hashtags = hashtags,
-                                        qualities = qualities,
-                                        languages = languages,
-                                        posterUrl = posterUrl,
-                                        videoUrl = videoUrl,
-                                        uploaderId = uploaderId,
-                                        rating = rating,
-                                        isSlide = isSlide,
-                                        badge = badge,
-                                        views = views,
-                                        likes = likes,
-                                        shares = shares,
-                                        downloads = downloads,
-                                        streamingPlatform = streamingPlatform,
-                                        firestoreId = docId,
-                                        timestamp = timestamp,
-                                        genre = genre,
-                                        uploaderName = uploaderName,
-                                        watchTime = watchTime
-                                    )
-                                    repository.insertMediaItem(newItem)
-                                }
-                            } catch (e: Exception) {
-                                android.util.Log.e("FirebaseSync", "Error parsing doc: ${doc.id}", e)
-                            }
-                        }
-
-                        val allLocalItems = repository.allMediaItems.firstOrNull() ?: emptyList()
-                        for (localItem in allLocalItems) {
-                            if (localItem.firestoreId.isNotEmpty() && !snapshotDocIds.contains(localItem.firestoreId)) {
-                                repository.deleteByFirestoreId(localItem.firestoreId)
-                            }
-                        }
-                    }
-                }
-            }
     }
 
     fun setTab(tab: String) {
@@ -545,73 +422,12 @@ class MediaViewModel(private val context: android.content.Context, private val r
         _searchQuery.value = query
     }
 
-    private var commentsListenerReg: com.google.firebase.firestore.ListenerRegistration? = null
-
-    private fun listenForComments(mediaItemId: Int, firestoreId: String) {
-        commentsListenerReg?.remove()
-        val db = firestore ?: return
-        if (firestoreId.isBlank()) return
-
-        commentsListenerReg = db.collection("media_items")
-            .document(firestoreId)
-            .collection("comments")
-            .addSnapshotListener { snapshot, error ->
-                if (error != null) {
-                    android.util.Log.e("CommentsSync", "Listen for comments failed.", error)
-                    return@addSnapshotListener
-                }
-
-                if (snapshot != null) {
-                    viewModelScope.launch {
-                        for (doc in snapshot.documents) {
-                            try {
-                                val userName = doc.getString("userName") ?: "Anonymous"
-                                val text = doc.getString("text") ?: ""
-                                val timestamp = doc.getLong("timestamp") ?: System.currentTimeMillis()
-
-                                // Check if comment already exists locally
-                                val existingComments = repository.getCommentsForMedia(mediaItemId).firstOrNull() ?: emptyList()
-                                val exists = existingComments.any { it.userName.trim() == userName.trim() && it.text.trim() == text.trim() }
-                                if (!exists) {
-                                    val newComment = Comment(
-                                        mediaItemId = mediaItemId,
-                                        userName = userName,
-                                        text = text,
-                                        timestamp = timestamp
-                                    )
-                                    repository.insertComment(newComment)
-                                }
-                            } catch (e: Exception) {
-                                android.util.Log.e("CommentsSync", "Error parsing comment doc", e)
-                            }
-                        }
-                    }
-                }
-            }
-    }
-
     fun selectMedia(id: Int?) {
         _selectedMediaId.value = id
         if (id != null) {
             viewModelScope.launch {
                 repository.incrementViews(id)
-                val media = repository.getMediaItemById(id).firstOrNull()
-                if (media != null) {
-                    val db = firestore
-                    if (media.firestoreId.isNotEmpty() && db != null) {
-                        try {
-                            db.collection("media_items").document(media.firestoreId)
-                                .update("views", com.google.firebase.firestore.FieldValue.increment(1))
-                        } catch (e: Exception) {
-                            android.util.Log.e("selectMedia", "Failed to increment views in Firestore", e)
-                        }
-                        listenForComments(id, media.firestoreId)
-                    }
-                }
             }
-        } else {
-            commentsListenerReg?.remove()
-            commentsListenerReg = null
         }
     }
 
@@ -622,18 +438,6 @@ class MediaViewModel(private val context: android.content.Context, private val r
     fun likeMedia(id: Int) {
         viewModelScope.launch {
             repository.incrementLikes(id)
-            val media = repository.getMediaItemById(id).firstOrNull()
-            if (media != null) {
-                val db = firestore
-                if (media.firestoreId.isNotEmpty() && db != null) {
-                    try {
-                        db.collection("media_items").document(media.firestoreId)
-                            .update("likes", com.google.firebase.firestore.FieldValue.increment(1))
-                    } catch (e: Exception) {
-                        android.util.Log.e("likeMedia", "Failed to increment likes in Firestore", e)
-                    }
-                }
-            }
         }
     }
 
@@ -642,15 +446,6 @@ class MediaViewModel(private val context: android.content.Context, private val r
             repository.incrementShares(id)
             val media = repository.getMediaItemById(id).firstOrNull()
             if (media != null) {
-                val db = firestore
-                if (media.firestoreId.isNotEmpty() && db != null) {
-                    try {
-                        db.collection("media_items").document(media.firestoreId)
-                            .update("shares", com.google.firebase.firestore.FieldValue.increment(1))
-                    } catch (e: Exception) {
-                        android.util.Log.e("shareMedia", "Failed to increment shares in Firestore", e)
-                    }
-                }
                 val shareText = "🎥 Check out this amazing show on wholeTV!\n\n" +
                         "Title: ${media.title}\n" +
                         "Description: ${media.description}\n" +
@@ -673,26 +468,6 @@ class MediaViewModel(private val context: android.content.Context, private val r
                 text = text.trim()
             )
             repository.insertComment(comment)
-
-            val media = repository.getMediaItemById(mediaItemId).firstOrNull()
-            if (media != null) {
-                val db = firestore
-                if (media.firestoreId.isNotEmpty() && db != null) {
-                    try {
-                        val commentData = hashMapOf(
-                            "userName" to userName.trim(),
-                            "text" to text.trim(),
-                            "timestamp" to System.currentTimeMillis()
-                        )
-                        db.collection("media_items")
-                            .document(media.firestoreId)
-                            .collection("comments")
-                            .add(commentData)
-                    } catch (e: Exception) {
-                        android.util.Log.e("submitComment", "Failed to add comment to Firestore", e)
-                    }
-                }
-            }
         }
     }
 
@@ -842,7 +617,7 @@ class MediaViewModel(private val context: android.content.Context, private val r
         }
     }
 
-    // Custom "Ultra Legendary Fast Upload System"
+    // Custom "Ultra Legendary Fast Upload System" using Cloudinary
     fun uploadMedia(
         title: String,
         description: String,
@@ -862,162 +637,193 @@ class MediaViewModel(private val context: android.content.Context, private val r
         onFailure: (String) -> Unit
     ) {
         android.util.Log.i("UploadMedia", "[STEP 1: File Selection & URI Validation] Starting upload process...")
-        android.util.Log.d("UploadMedia", "Selected Video URI: $videoUri")
-        android.util.Log.d("UploadMedia", "Selected Cover URI: $coverUri")
-
         if (videoUri == null) {
-            val errorMsg = "URI validation failed: selected video URI is null."
-            android.util.Log.e("UploadMedia", errorMsg)
-            onFailure(errorMsg)
+            onFailure("selected video URI is null.")
             return
         }
-
-        android.util.Log.i("UploadMedia", "[STEP 2: URI Validation Succeeded] Input fields: title='$title', genre='$genre', uploaderName='$uploaderName'")
 
         viewModelScope.launch {
             _isUploading.value = true
             _uploadProgressValue.value = 0f
 
-            val db = firestore
-            val st = storage
+            val context = context
+            val mimeType = context.contentResolver.getType(videoUri) ?: ""
+            val isVideoMime = mimeType.startsWith("video/") || videoUri.toString().endsWith(".mp4") || videoUri.toString().endsWith(".mkv") || videoUri.toString().endsWith(".webm")
+            if (!isVideoMime) {
+                _isUploading.value = false
+                onFailure("MIME type validation failed: Selected file is not a video.")
+                return@launch
+            }
 
-            if (db == null || st == null) {
-                android.util.Log.w("UploadMedia", "Firebase services are null! Running local fallback mode.")
-                try {
-                    delay(300)
-                    _uploadProgressValue.value = 0.5f
-                    delay(300)
-                    _uploadProgressValue.value = 1.0f
-
-                    val videoUrl = videoUri.toString()
-                    val posterUrl = coverUri?.toString() ?: "https://images.unsplash.com/photo-1536440136628-849c177e76a1?w=500"
-
-                    val newItem = MediaItem(
-                        title = title.trim(),
-                        description = description.trim(),
-                        category = category.trim(),
-                        hashtags = hashtags.trim(),
-                        qualities = qualities.trim(),
-                        languages = languages.trim(),
-                        rating = rating,
-                        isSlide = isSlide,
-                        badge = badge.trim(),
-                        streamingPlatform = streamingPlatform,
-                        videoUrl = videoUrl,
-                        posterUrl = posterUrl,
-                        uploaderId = currentUserId,
-                        firestoreId = "local_" + java.util.UUID.randomUUID().toString(),
-                        views = (100..500).random(),
-                        likes = 0,
-                        shares = 0,
-                        downloads = 0,
-                        timestamp = System.currentTimeMillis(),
-                        genre = genre.trim(),
-                        uploaderName = uploaderName.trim(),
-                        watchTime = 0L
-                    )
-
-                    repository.insertMediaItem(newItem)
-                    _isUploading.value = false
-                    android.util.Log.i("UploadMedia", "Successfully added media locally!")
-                    onSuccess()
-                } catch (e: Exception) {
-                    _isUploading.value = false
-                    android.util.Log.e("UploadMedia", "Failed to upload locally", e)
-                    onFailure(e.localizedMessage ?: "Failed to upload locally.")
-                }
+            val videoFile = getFileFromUri(context, videoUri)
+            if (videoFile == null || !videoFile.exists() || !videoFile.canRead()) {
+                _isUploading.value = false
+                onFailure("Failed to access or read the selected video file.")
                 return@launch
             }
 
             try {
-                val uploadId = java.util.UUID.randomUUID().toString()
-                android.util.Log.i("UploadMedia", "[STEP 3: Upload Start] Generated upload ID: $uploadId")
+                // Initialize OkHttpClient
+                val okHttpClient = okhttp3.OkHttpClient.Builder()
+                    .connectTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+                    .readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+                    .writeTimeout(300, java.util.concurrent.TimeUnit.SECONDS)
+                    .build()
 
-                // 1. Upload Video to Firebase Storage
-                val videoRef = st.reference.child("videos/$uploadId.mp4")
-                android.util.Log.i("UploadMedia", "[STEP 4: StorageReference Path] Video path: ${videoRef.path} (Bucket: ${st.reference.bucket})")
-                
-                val videoUploadTask = videoRef.putFile(videoUri)
+                // Upload Video to Cloudinary
+                val videoProgressBody = ProgressRequestBody(videoFile, mimeType) { progress ->
+                    _uploadProgressValue.value = progress * 0.8f
+                }
+                val videoMultipartBody = okhttp3.MultipartBody.Builder()
+                    .setType(okhttp3.MultipartBody.FORM)
+                    .addFormDataPart("file", videoFile.name, videoProgressBody)
+                    .addFormDataPart("upload_preset", "wholetv_upload")
+                    .build()
+                val videoRequest = okhttp3.Request.Builder()
+                    .url("https://api.cloudinary.com/v1_1/wholetv/video/upload")
+                    .post(videoMultipartBody)
+                    .build()
 
-                videoUploadTask.addOnProgressListener { taskSnapshot ->
-                    val progress = (taskSnapshot.bytesTransferred.toFloat() / taskSnapshot.totalByteCount.toFloat()) * 0.8f
-                    _uploadProgressValue.value = progress
-                    android.util.Log.d("UploadMedia", "[STEP 5: Video Upload Progress] ${(progress * 100).toInt()}% uploaded (${taskSnapshot.bytesTransferred}/${taskSnapshot.totalByteCount} bytes)")
+                val videoCall = okHttpClient.newCall(videoRequest)
+                coroutineContext[Job]?.invokeOnCompletion {
+                    if (it is kotlinx.coroutines.CancellationException) {
+                        videoCall.cancel()
+                    }
                 }
 
-                android.util.Log.i("UploadMedia", "Waiting for video upload to complete...")
-                val videoSnapshot = videoUploadTask.await()
-                android.util.Log.i("UploadMedia", "[STEP 6: Video Upload Completion] Video uploaded successfully to Storage.")
+                // Execute with up to 3 retries for temporary network failure
+                var videoAttempts = 0
+                val maxAttempts = 3
+                var videoResponse: okhttp3.Response? = null
+                var uploadSuccess = false
+                while (videoAttempts < maxAttempts && !uploadSuccess) {
+                    videoAttempts++
+                    try {
+                        videoResponse = withContext(Dispatchers.IO) { videoCall.execute() }
+                        if (videoResponse.isSuccessful) {
+                            uploadSuccess = true
+                        } else {
+                            if (videoResponse.code >= 500) {
+                                delay(2000L * videoAttempts)
+                            } else {
+                                break
+                            }
+                        }
+                    } catch (e: java.io.IOException) {
+                        if (videoAttempts >= maxAttempts) throw e
+                        delay(2000L * videoAttempts)
+                    }
+                }
 
-                android.util.Log.i("UploadMedia", "[STEP 7: Download URL Generation] Getting video download URL directly from StorageReference...")
-                val videoUrl = videoRef.downloadUrl.await().toString()
-                android.util.Log.i("UploadMedia", "Video download URL generated successfully: $videoUrl")
+                if (videoResponse == null || !videoResponse.isSuccessful) {
+                    val errorMsg = videoResponse?.body?.string() ?: "Network error or invalid response from Cloudinary."
+                    _isUploading.value = false
+                    onFailure("Cloudinary upload failed: $errorMsg")
+                    videoFile.delete()
+                    return@launch
+                }
 
-                // 2. Upload Cover Image (if selected) to Firebase Storage
+                val videoResBody = videoResponse.body?.string() ?: ""
+                val videoJson = org.json.JSONObject(videoResBody)
+                val videoUrl = videoJson.getString("secure_url")
+                val publicId = videoJson.getString("public_id")
+                videoFile.delete()
+
+                // Upload Cover Image (if selected) to Cloudinary
                 var posterUrl = ""
                 if (coverUri != null) {
-                    val coverRef = st.reference.child("covers/$uploadId.jpg")
-                    android.util.Log.i("UploadMedia", "Cover StorageReference path: ${coverRef.path}")
-                    
-                    val coverUploadTask = coverRef.putFile(coverUri)
+                    val coverFile = getFileFromUri(context, coverUri)
+                    if (coverFile != null && coverFile.exists() && coverFile.canRead()) {
+                        val coverMimeType = context.contentResolver.getType(coverUri) ?: "image/jpeg"
+                        val coverProgressBody = ProgressRequestBody(coverFile, coverMimeType) { progress ->
+                            _uploadProgressValue.value = 0.8f + (progress * 0.2f)
+                        }
+                        val coverMultipartBody = okhttp3.MultipartBody.Builder()
+                            .setType(okhttp3.MultipartBody.FORM)
+                            .addFormDataPart("file", coverFile.name, coverProgressBody)
+                            .addFormDataPart("upload_preset", "wholetv_upload")
+                            .build()
+                        val coverRequest = okhttp3.Request.Builder()
+                            .url("https://api.cloudinary.com/v1_1/wholetv/image/upload")
+                            .post(coverMultipartBody)
+                            .build()
 
-                    coverUploadTask.addOnProgressListener { taskSnapshot ->
-                        val progress = 0.8f + ((taskSnapshot.bytesTransferred.toFloat() / taskSnapshot.totalByteCount.toFloat()) * 0.2f)
-                        _uploadProgressValue.value = progress
-                        android.util.Log.d("UploadMedia", "Cover upload progress: ${(progress * 100).toInt()}%")
+                        val coverCall = okHttpClient.newCall(coverRequest)
+                        coroutineContext[Job]?.invokeOnCompletion {
+                            if (it is kotlinx.coroutines.CancellationException) {
+                                coverCall.cancel()
+                            }
+                        }
+
+                        var coverAttempts = 0
+                        var coverResponse: okhttp3.Response? = null
+                        var coverSuccess = false
+                        while (coverAttempts < maxAttempts && !coverSuccess) {
+                            coverAttempts++
+                            try {
+                                coverResponse = withContext(Dispatchers.IO) { coverCall.execute() }
+                                if (coverResponse.isSuccessful) {
+                                    coverSuccess = true
+                                } else {
+                                    if (coverResponse.code >= 500) {
+                                        delay(2000L * coverAttempts)
+                                    } else {
+                                        break
+                                    }
+                                }
+                            } catch (e: java.io.IOException) {
+                                if (coverAttempts >= maxAttempts) throw e
+                                delay(2000L * coverAttempts)
+                            }
+                        }
+
+                        if (coverResponse != null && coverResponse.isSuccessful) {
+                            val coverResBody = coverResponse.body?.string() ?: ""
+                            val coverJson = org.json.JSONObject(coverResBody)
+                            posterUrl = coverJson.getString("secure_url")
+                        }
+                        coverFile.delete()
                     }
+                }
 
-                    android.util.Log.i("UploadMedia", "Waiting for cover image upload to complete...")
-                    coverUploadTask.await()
-                    android.util.Log.i("UploadMedia", "Cover uploaded successfully to Storage.")
-
-                    android.util.Log.i("UploadMedia", "Getting cover download URL directly from StorageReference...")
-                    posterUrl = coverRef.downloadUrl.await().toString()
-                    android.util.Log.i("UploadMedia", "Cover download URL generated: $posterUrl")
-                } else {
+                if (posterUrl.isEmpty()) {
                     posterUrl = "https://images.unsplash.com/photo-1536440136628-849c177e76a1?w=500"
-                    android.util.Log.i("UploadMedia", "No cover image selected. Using fallback poster URL: $posterUrl")
                 }
 
                 _uploadProgressValue.value = 1.0f
 
-                // 3. Save Metadata to Cloud Firestore
-                val meta = hashMapOf(
-                    "title" to title.trim(),
-                    "description" to description.trim(),
-                    "category" to category.trim(),
-                    "hashtags" to hashtags.trim(),
-                    "qualities" to qualities.trim(),
-                    "languages" to languages.trim(),
-                    "rating" to rating,
-                    "isSlide" to isSlide,
-                    "badge" to badge.trim(),
-                    "streamingPlatform" to streamingPlatform,
-                    "videoUrl" to videoUrl,
-                    "posterUrl" to posterUrl,
-                    "uploaderId" to currentUserId,
-                    "views" to (100..500).random(),
-                    "likes" to 0,
-                    "shares" to 0,
-                    "downloads" to 0,
-                    "timestamp" to System.currentTimeMillis(),
-                    "genre" to genre.trim(),
-                    "uploaderName" to uploaderName.trim(),
-                    "watchTime" to 0L
+                // Insert new MediaItem directly into Room database
+                val newItem = MediaItem(
+                    title = title.trim(),
+                    description = description.trim(),
+                    category = category.trim(),
+                    hashtags = hashtags.trim(),
+                    qualities = qualities.trim(),
+                    languages = languages.trim(),
+                    rating = rating,
+                    isSlide = isSlide,
+                    badge = badge.trim(),
+                    streamingPlatform = streamingPlatform,
+                    videoUrl = videoUrl,
+                    posterUrl = posterUrl,
+                    uploaderId = currentUserId,
+                    firestoreId = publicId, // Use Cloudinary public ID as unique identifier
+                    views = (100..500).random(),
+                    likes = 0,
+                    shares = 0,
+                    downloads = 0,
+                    timestamp = System.currentTimeMillis(),
+                    genre = genre.trim(),
+                    uploaderName = uploaderName.trim(),
+                    watchTime = 0L
                 )
 
-                android.util.Log.i("UploadMedia", "[STEP 8: Firestore Write] Writing metadata document to 'media_items/$uploadId'...")
-                db.collection("media_items").document(uploadId).set(meta).await()
-                android.util.Log.i("UploadMedia", "[STEP 9: Firestore Write Success] Metadata written successfully.")
-
+                repository.insertMediaItem(newItem)
                 _isUploading.value = false
-                android.util.Log.i("UploadMedia", "[STEP 10: Upload System Success] Entire upload flow completed 100% successfully!")
                 onSuccess()
             } catch (e: Exception) {
                 _isUploading.value = false
-                android.util.Log.e("UploadMedia", "[UPLOAD SYSTEM FAILURE] Direct Firebase Exception encountered:", e)
-                val errorMessage = "Upload failed: " + (e.localizedMessage ?: "Unknown Firebase error")
-                onFailure(errorMessage)
+                onFailure(e.localizedMessage ?: "Failed to upload to Cloudinary.")
             }
         }
     }
@@ -1025,62 +831,10 @@ class MediaViewModel(private val context: android.content.Context, private val r
     fun deleteMedia(firestoreId: String, onSuccess: () -> Unit, onFailure: (String) -> Unit) {
         if (firestoreId.isBlank()) return
         viewModelScope.launch {
-            val db = firestore
-            val st = storage
-
-            if (db == null || st == null) {
-                // LOCAL ONLY FALLBACK MODE
-                try {
-                    val existing = repository.getMediaItemByFirestoreId(firestoreId)
-                    if (existing != null) {
-                        if (existing.uploaderId != currentUserId) {
-                            onFailure("You are not authorized to delete this video.")
-                            return@launch
-                        }
-                        repository.deleteByFirestoreId(firestoreId)
-                        onSuccess()
-                    } else {
-                        onFailure("Video not found.")
-                    }
-                } catch (e: Exception) {
-                    onFailure(e.localizedMessage ?: "Failed to delete video.")
-                }
-                return@launch
-            }
-
             try {
-                val docRef = db.collection("media_items").document(firestoreId)
-                val doc = docRef.get().await()
-
-                if (doc.exists()) {
-                    val uploader = doc.getString("uploaderId") ?: ""
-                    if (uploader != currentUserId) {
-                        onFailure("You are not authorized to delete this video.")
-                        return@launch
-                    }
-
-                    docRef.delete().await()
-
-                    try {
-                        val videoRef = st.reference.child("videos/$firestoreId.mp4")
-                        videoRef.delete()
-                    } catch (e: Exception) {
-                        android.util.Log.e("DeleteMedia", "Failed to delete video file", e)
-                    }
-
-                    try {
-                        val coverRef = st.reference.child("covers/$firestoreId.jpg")
-                        coverRef.delete()
-                    } catch (e: Exception) {
-                        android.util.Log.e("DeleteMedia", "Failed to delete cover file", e)
-                    }
-
-                    onSuccess()
-                } else {
-                    onFailure("Video not found.")
-                }
+                repository.deleteByFirestoreId(firestoreId)
+                onSuccess()
             } catch (e: Exception) {
-                android.util.Log.e("DeleteMedia", "Failed to delete", e)
                 onFailure(e.localizedMessage ?: "Failed to delete video.")
             }
         }
@@ -1312,5 +1066,36 @@ class MediaViewModelFactory(private val context: android.content.Context, privat
             return MediaViewModel(context, repository) as T
         }
         throw IllegalArgumentException("Unknown ViewModel class")
+    }
+}
+
+class ProgressRequestBody(
+    private val file: File,
+    private val contentType: String,
+    private val onProgress: (progress: Float) -> Unit
+) : okhttp3.RequestBody() {
+
+    override fun contentType(): okhttp3.MediaType? {
+        return contentType.toMediaTypeOrNull()
+    }
+
+    override fun contentLength(): Long {
+        return file.length()
+    }
+
+    override fun writeTo(sink: okio.BufferedSink) {
+        val fileLength = file.length()
+        val buffer = ByteArray(4096)
+        var uploaded: Long = 0
+
+        file.inputStream().use { fileInputStream ->
+            var read: Int
+            while (fileInputStream.read(buffer).also { read = it } != -1) {
+                sink.write(buffer, 0, read)
+                uploaded += read
+                val progress = if (fileLength > 0) uploaded.toFloat() / fileLength else 0f
+                onProgress(progress)
+            }
+        }
     }
 }

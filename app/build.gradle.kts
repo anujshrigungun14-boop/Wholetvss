@@ -96,8 +96,6 @@ dependencies {
   implementation(libs.coil.compose)
   implementation(libs.converter.moshi)
   implementation(libs.firebase.ai)
-  implementation(libs.firebase.firestore)
-  implementation(libs.firebase.storage)
   implementation(libs.androidx.media3.exoplayer)
   implementation(libs.androidx.media3.ui)
 
