@@ -1,0 +1,6 @@
+{
+  "name": "wholeTV",
+  "description": "An ultra-premium streaming platform for Movies, Web Series, and Reality Shows featuring a legendary fast upload system, comment systems, dynamic sliders, multi-lingual selection, and ultra-fast simulated downloads.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

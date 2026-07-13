@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    
+    <!-- Stylized TV / Monitor Border -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#E50914"
+        android:strokeWidth="4"
+        android:strokeLineCap="round"
+        android:pathData="M 28 32 C 28 32, 54 28, 80 32 C 80 32, 84 54, 80 76 C 80 76, 54 80, 28 76 C 28 76, 24 54, 28 32 Z" />
+        
+    <!-- Golden Play Triangle Accent inside TV -->
+    <path
+        android:fillColor="#FFFFB800"
+        android:pathData="M 46 42 L 68 54 L 46 66 Z" />
+        
+    <!-- Sleek Stand under TV -->
+    <path
+        android:fillColor="#E50914"
+        android:pathData="M 44 76 L 64 76 L 59 86 L 49 86 Z" />
+</vector>
