@@ -1,4 +1,4 @@
-package com.example.data
+package com.company.wholetv.data
 
 import androidx.room.Entity
 import androidx.room.PrimaryKey
@@ -27,5 +27,7 @@ data class MediaItem(
     val timestamp: Long = System.currentTimeMillis(),
     val genre: String = "Action",
     val uploaderName: String = "Anonymous",
-    val watchTime: Long = 0
+    val watchTime: Long = 0,
+    val localFilePath: String? = null,
+    val isDownloaded: Boolean = false
 )

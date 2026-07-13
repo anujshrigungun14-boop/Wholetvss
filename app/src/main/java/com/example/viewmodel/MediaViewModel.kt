@@ -1,16 +1,22 @@
-package com.example.viewmodel
+package com.company.wholetv.viewmodel
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
-import com.example.data.Comment
-import com.example.data.MediaItem
-import com.example.data.MediaRepository
+import com.company.wholetv.data.Comment
+import com.company.wholetv.data.MediaItem
+import com.company.wholetv.data.MediaRepository
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import java.io.File
+import java.io.RandomAccessFile
+import java.net.HttpURLConnection
+import java.net.URL
 
 class MediaViewModel(private val context: android.content.Context, private val repository: MediaRepository) : ViewModel() {
 
@@ -258,6 +264,102 @@ class MediaViewModel(private val context: android.content.Context, private val r
     fun logoutUser() {
         auth?.signOut()
         _isUserLoggedIn.value = false
+        _userBio.value = "Love watching amazing content on wholeTV!"
+        _userUsername.value = "@streamer"
+    }
+
+    // Customizable User Profile states
+    private val _userBio = MutableStateFlow(sharedPrefs.getString("user_bio", "Love watching amazing content on wholeTV!") ?: "")
+    val userBio: StateFlow<String> = _userBio.asStateFlow()
+
+    private val _userUsername = MutableStateFlow(sharedPrefs.getString("user_username", "@streamer") ?: "")
+    val userUsername: StateFlow<String> = _userUsername.asStateFlow()
+
+    fun updateUserProfile(displayName: String, username: String, bio: String, onSuccess: () -> Unit, onFailure: (String) -> Unit) {
+        val u = auth?.currentUser
+        if (u == null) {
+            // Local mode fallback
+            sharedPrefs.edit()
+                .putString("user_display_name", displayName)
+                .putString("user_username", username)
+                .putString("user_bio", bio)
+                .apply()
+            _userBio.value = bio
+            _userUsername.value = username
+            onSuccess()
+            return
+        }
+
+        viewModelScope.launch {
+            try {
+                // 1. Update Display Name in Firebase Auth
+                val updates = com.google.firebase.auth.userProfileChangeRequest {
+                    this.displayName = displayName
+                }
+                u.updateProfile(updates).await()
+
+                // 2. Save username and bio in Firestore and SharedPreferences
+                sharedPrefs.edit()
+                    .putString("user_username", username)
+                    .putString("user_bio", bio)
+                    .apply()
+                _userBio.value = bio
+                _userUsername.value = username
+
+                val db = firestore
+                if (db != null) {
+                    val userMeta = hashMapOf(
+                        "displayName" to displayName,
+                        "username" to username,
+                        "bio" to bio,
+                        "email" to (u.email ?: "")
+                    )
+                    db.collection("users").document(u.uid).set(userMeta).await()
+                }
+
+                onSuccess()
+            } catch (e: Exception) {
+                onFailure(e.localizedMessage ?: "Failed to update user profile.")
+            }
+        }
+    }
+
+    fun uploadProfilePicture(uri: android.net.Uri, onSuccess: (String) -> Unit, onFailure: (String) -> Unit) {
+        val u = auth?.currentUser
+        val st = storage
+        if (u == null || st == null) {
+            // Local fallback
+            sharedPrefs.edit().putString("user_photo_url", uri.toString()).apply()
+            onSuccess(uri.toString())
+            return
+        }
+
+        viewModelScope.launch {
+            try {
+                val ref = st.reference.child("profiles/${u.uid}.jpg")
+                val uploadTask = ref.putFile(uri)
+                uploadTask.await()
+                
+                val downloadUrl = ref.downloadUrl.await().toString()
+                
+                val updates = com.google.firebase.auth.userProfileChangeRequest {
+                    this.photoUri = android.net.Uri.parse(downloadUrl)
+                }
+                u.updateProfile(updates).await()
+                
+                sharedPrefs.edit().putString("user_photo_url", downloadUrl).apply()
+                
+                // Sync to user doc in Firestore
+                val db = firestore
+                if (db != null) {
+                    db.collection("users").document(u.uid).update("photoUrl", downloadUrl).await()
+                }
+
+                onSuccess(downloadUrl)
+            } catch (e: Exception) {
+                onFailure(e.localizedMessage ?: "Failed to upload profile image.")
+            }
+        }
     }
 
     // Dynamic Watch Time Tracking
@@ -594,25 +696,149 @@ class MediaViewModel(private val context: android.content.Context, private val r
         }
     }
 
-    // Legendary Ultra-Fast Download System
+    // Real Range-Request Pauseable & Resumeable Download Manager
+    private val downloadJobs = mutableMapOf<Int, Job>()
+    private val downloadedBytesMap = mutableMapOf<Int, Long>()
+    private val totalBytesMap = mutableMapOf<Int, Long>()
+
     fun startUltraFastDownload(id: Int) {
         val currentStatus = _downloadStatus.value[id] ?: "None"
         if (currentStatus == "Downloading" || currentStatus == "Completed") return
 
-        viewModelScope.launch {
-            _downloadStatus.value = _downloadStatus.value + (id to "Downloading")
-            _downloadProgress.value = _downloadProgress.value + (id to 0f)
+        val job = viewModelScope.launch(Dispatchers.IO) {
+            try {
+                _downloadStatus.value = _downloadStatus.value + (id to "Downloading")
+                _downloadProgress.value = _downloadProgress.value + (id to 0f)
+                
+                val media = repository.getMediaItemById(id).firstOrNull() ?: throw Exception("Media item not found")
+                val videoUrl = media.videoUrl
+                if (videoUrl.isBlank()) throw Exception("No video URL found for this content")
 
-            // Simulate ultra fast download (e.g. 100MB/s progress bars)
-            val steps = 10
-            for (i in 1..steps) {
-                delay(200) // 2 seconds total legendary download
-                val progress = i.toFloat() / steps
-                _downloadProgress.value = _downloadProgress.value + (id to progress)
+                val downloadsDir = File(context.filesDir, "downloads")
+                if (!downloadsDir.exists()) downloadsDir.mkdirs()
+
+                val localFile = File(downloadsDir, "$id.mp4")
+                var startBytes = 0L
+                if (localFile.exists() && currentStatus == "Paused") {
+                    startBytes = localFile.length()
+                } else if (localFile.exists()) {
+                    localFile.delete()
+                }
+
+                val url = URL(videoUrl)
+                val connection = url.openConnection() as HttpURLConnection
+                connection.connectTimeout = 15000
+                connection.readTimeout = 20000
+
+                if (startBytes > 0) {
+                    connection.setRequestProperty("Range", "bytes=$startBytes-")
+                }
+
+                connection.connect()
+
+                val responseCode = connection.responseCode
+                if (responseCode != HttpURLConnection.HTTP_OK && responseCode != HttpURLConnection.HTTP_PARTIAL) {
+                    throw Exception("Server returned HTTP response: $responseCode")
+                }
+
+                val contentLength = connection.contentLengthLong
+                val totalBytes = if (startBytes > 0) {
+                    startBytes + contentLength
+                } else {
+                    contentLength
+                }
+
+                totalBytesMap[id] = totalBytes
+                downloadedBytesMap[id] = startBytes
+
+                val randomAccessFile = RandomAccessFile(localFile, "rw")
+                randomAccessFile.seek(startBytes)
+
+                val inputStream = connection.inputStream
+                val buffer = ByteArray(16384)
+                var bytesRead: Int
+                var currentBytes = startBytes
+
+                while (true) {
+                    if (_downloadStatus.value[id] == "Paused") {
+                        break
+                    }
+
+                    bytesRead = inputStream.read(buffer)
+                    if (bytesRead == -1) break
+
+                    randomAccessFile.write(buffer, 0, bytesRead)
+                    currentBytes += bytesRead
+                    downloadedBytesMap[id] = currentBytes
+
+                    if (totalBytes > 0) {
+                        val progress = currentBytes.toFloat() / totalBytes
+                        _downloadProgress.value = _downloadProgress.value + (id to progress)
+                    }
+                }
+
+                randomAccessFile.close()
+                inputStream.close()
+                connection.disconnect()
+
+                if (_downloadStatus.value[id] == "Paused") {
+                    android.util.Log.i("DownloadManager", "Download paused for media ID: $id at $currentBytes bytes")
+                } else {
+                    _downloadStatus.value = _downloadStatus.value + (id to "Completed")
+                    _downloadProgress.value = _downloadProgress.value + (id to 1.0f)
+                    
+                    val updated = media.copy(
+                        localFilePath = localFile.absolutePath,
+                        isDownloaded = true
+                    )
+                    repository.insertMediaItem(updated)
+                    repository.incrementDownloads(id)
+                    android.util.Log.i("DownloadManager", "Download completed successfully for media ID: $id")
+                }
+            } catch (e: Exception) {
+                android.util.Log.e("DownloadManager", "Download failed for media ID: $id", e)
+                _downloadStatus.value = _downloadStatus.value + (id to "Failed")
             }
+        }
+        downloadJobs[id] = job
+    }
 
-            _downloadStatus.value = _downloadStatus.value + (id to "Completed")
-            repository.incrementDownloads(id)
+    fun pauseDownload(id: Int) {
+        _downloadStatus.value = _downloadStatus.value + (id to "Paused")
+        downloadJobs[id]?.cancel()
+        downloadJobs.remove(id)
+    }
+
+    fun resumeDownload(id: Int) {
+        startUltraFastDownload(id)
+    }
+
+    fun deleteDownload(id: Int) {
+        downloadJobs[id]?.cancel()
+        downloadJobs.remove(id)
+        
+        _downloadStatus.value = _downloadStatus.value + (id to "None")
+        _downloadProgress.value = _downloadProgress.value + (id to 0f)
+
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val downloadsDir = File(context.filesDir, "downloads")
+                val localFile = File(downloadsDir, "$id.mp4")
+                if (localFile.exists()) {
+                    localFile.delete()
+                }
+                val media = repository.getMediaItemById(id).firstOrNull()
+                if (media != null) {
+                    val updated = media.copy(
+                        localFilePath = null,
+                        isDownloaded = false
+                    )
+                    repository.insertMediaItem(updated)
+                }
+                android.util.Log.i("DownloadManager", "Deleted download for media ID: $id")
+            } catch (e: Exception) {
+                android.util.Log.e("DownloadManager", "Failed to delete download for media ID: $id", e)
+            }
         }
     }
 
@@ -635,10 +861,18 @@ class MediaViewModel(private val context: android.content.Context, private val r
         onSuccess: () -> Unit,
         onFailure: (String) -> Unit
     ) {
+        android.util.Log.i("UploadMedia", "[STEP 1: File Selection & URI Validation] Starting upload process...")
+        android.util.Log.d("UploadMedia", "Selected Video URI: $videoUri")
+        android.util.Log.d("UploadMedia", "Selected Cover URI: $coverUri")
+
         if (videoUri == null) {
-            onFailure("Please select a video file.")
+            val errorMsg = "URI validation failed: selected video URI is null."
+            android.util.Log.e("UploadMedia", errorMsg)
+            onFailure(errorMsg)
             return
         }
+
+        android.util.Log.i("UploadMedia", "[STEP 2: URI Validation Succeeded] Input fields: title='$title', genre='$genre', uploaderName='$uploaderName'")
 
         viewModelScope.launch {
             _isUploading.value = true
@@ -648,7 +882,7 @@ class MediaViewModel(private val context: android.content.Context, private val r
             val st = storage
 
             if (db == null || st == null) {
-                // LOCAL ONLY FALLBACK MODE
+                android.util.Log.w("UploadMedia", "Firebase services are null! Running local fallback mode.")
                 try {
                     delay(300)
                     _uploadProgressValue.value = 0.5f
@@ -685,9 +919,11 @@ class MediaViewModel(private val context: android.content.Context, private val r
 
                     repository.insertMediaItem(newItem)
                     _isUploading.value = false
+                    android.util.Log.i("UploadMedia", "Successfully added media locally!")
                     onSuccess()
                 } catch (e: Exception) {
                     _isUploading.value = false
+                    android.util.Log.e("UploadMedia", "Failed to upload locally", e)
                     onFailure(e.localizedMessage ?: "Failed to upload locally.")
                 }
                 return@launch
@@ -695,34 +931,52 @@ class MediaViewModel(private val context: android.content.Context, private val r
 
             try {
                 val uploadId = java.util.UUID.randomUUID().toString()
+                android.util.Log.i("UploadMedia", "[STEP 3: Upload Start] Generated upload ID: $uploadId")
 
                 // 1. Upload Video to Firebase Storage
                 val videoRef = st.reference.child("videos/$uploadId.mp4")
+                android.util.Log.i("UploadMedia", "[STEP 4: StorageReference Path] Video path: ${videoRef.path} (Bucket: ${st.reference.bucket})")
+                
                 val videoUploadTask = videoRef.putFile(videoUri)
 
                 videoUploadTask.addOnProgressListener { taskSnapshot ->
                     val progress = (taskSnapshot.bytesTransferred.toFloat() / taskSnapshot.totalByteCount.toFloat()) * 0.8f
                     _uploadProgressValue.value = progress
+                    android.util.Log.d("UploadMedia", "[STEP 5: Video Upload Progress] ${(progress * 100).toInt()}% uploaded (${taskSnapshot.bytesTransferred}/${taskSnapshot.totalByteCount} bytes)")
                 }
 
+                android.util.Log.i("UploadMedia", "Waiting for video upload to complete...")
                 val videoSnapshot = videoUploadTask.await()
-                val videoUrl = videoSnapshot.metadata!!.reference!!.downloadUrl.await().toString()
+                android.util.Log.i("UploadMedia", "[STEP 6: Video Upload Completion] Video uploaded successfully to Storage.")
+
+                android.util.Log.i("UploadMedia", "[STEP 7: Download URL Generation] Getting video download URL directly from StorageReference...")
+                val videoUrl = videoRef.downloadUrl.await().toString()
+                android.util.Log.i("UploadMedia", "Video download URL generated successfully: $videoUrl")
 
                 // 2. Upload Cover Image (if selected) to Firebase Storage
                 var posterUrl = ""
                 if (coverUri != null) {
                     val coverRef = st.reference.child("covers/$uploadId.jpg")
+                    android.util.Log.i("UploadMedia", "Cover StorageReference path: ${coverRef.path}")
+                    
                     val coverUploadTask = coverRef.putFile(coverUri)
 
                     coverUploadTask.addOnProgressListener { taskSnapshot ->
                         val progress = 0.8f + ((taskSnapshot.bytesTransferred.toFloat() / taskSnapshot.totalByteCount.toFloat()) * 0.2f)
                         _uploadProgressValue.value = progress
+                        android.util.Log.d("UploadMedia", "Cover upload progress: ${(progress * 100).toInt()}%")
                     }
 
-                    val coverSnapshot = coverUploadTask.await()
-                    posterUrl = coverSnapshot.metadata!!.reference!!.downloadUrl.await().toString()
+                    android.util.Log.i("UploadMedia", "Waiting for cover image upload to complete...")
+                    coverUploadTask.await()
+                    android.util.Log.i("UploadMedia", "Cover uploaded successfully to Storage.")
+
+                    android.util.Log.i("UploadMedia", "Getting cover download URL directly from StorageReference...")
+                    posterUrl = coverRef.downloadUrl.await().toString()
+                    android.util.Log.i("UploadMedia", "Cover download URL generated: $posterUrl")
                 } else {
                     posterUrl = "https://images.unsplash.com/photo-1536440136628-849c177e76a1?w=500"
+                    android.util.Log.i("UploadMedia", "No cover image selected. Using fallback poster URL: $posterUrl")
                 }
 
                 _uploadProgressValue.value = 1.0f
@@ -752,14 +1006,18 @@ class MediaViewModel(private val context: android.content.Context, private val r
                     "watchTime" to 0L
                 )
 
+                android.util.Log.i("UploadMedia", "[STEP 8: Firestore Write] Writing metadata document to 'media_items/$uploadId'...")
                 db.collection("media_items").document(uploadId).set(meta).await()
+                android.util.Log.i("UploadMedia", "[STEP 9: Firestore Write Success] Metadata written successfully.")
 
                 _isUploading.value = false
+                android.util.Log.i("UploadMedia", "[STEP 10: Upload System Success] Entire upload flow completed 100% successfully!")
                 onSuccess()
             } catch (e: Exception) {
                 _isUploading.value = false
-                android.util.Log.e("UploadMedia", "Failed to upload", e)
-                onFailure(e.localizedMessage ?: "Unknown error occurred")
+                android.util.Log.e("UploadMedia", "[UPLOAD SYSTEM FAILURE] Direct Firebase Exception encountered:", e)
+                val errorMessage = "Upload failed: " + (e.localizedMessage ?: "Unknown Firebase error")
+                onFailure(errorMessage)
             }
         }
     }

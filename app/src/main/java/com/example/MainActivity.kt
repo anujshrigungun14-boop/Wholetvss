@@ -1,8 +1,9 @@
-package com.example
+package com.company.wholetv
 
 import android.content.Intent
 import android.os.Bundle
 import android.widget.Toast
+import java.io.File
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -10,6 +11,10 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.*
@@ -52,13 +57,13 @@ import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
-import com.example.data.AppDatabase
-import com.example.data.Comment
-import com.example.data.MediaItem
-import com.example.data.MediaRepository
-import com.example.ui.theme.*
-import com.example.viewmodel.MediaViewModel
-import com.example.viewmodel.MediaViewModelFactory
+import com.company.wholetv.data.AppDatabase
+import com.company.wholetv.data.Comment
+import com.company.wholetv.data.MediaItem
+import com.company.wholetv.data.MediaRepository
+import com.company.wholetv.ui.theme.*
+import com.company.wholetv.viewmodel.MediaViewModel
+import com.company.wholetv.viewmodel.MediaViewModelFactory
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -1282,11 +1287,61 @@ fun CommunityScreen() {
 // ==========================================
 @Composable
 fun MeProfileScreen(viewModel: MediaViewModel) {
+    val context = LocalContext.current
+    val isUserLoggedIn by viewModel.isUserLoggedIn.collectAsStateWithLifecycle()
     val allMediaItems by viewModel.mediaItems.collectAsStateWithLifecycle()
     val downloadStatus by viewModel.downloadStatus.collectAsStateWithLifecycle()
+    val downloadProgress by viewModel.downloadProgress.collectAsStateWithLifecycle()
+
+    // Auth input states
+    var isSignUpMode by remember { mutableStateOf(false) }
+    var emailInput by remember { mutableStateOf("") }
+    var passwordInput by remember { mutableStateOf("") }
+    var authError by remember { mutableStateOf("") }
+
+    // User Profile customizable states
+    val userBio by viewModel.userBio.collectAsStateWithLifecycle()
+    val userUsername by viewModel.userUsername.collectAsStateWithLifecycle()
     
-    val downloadedItems = remember(allMediaItems, downloadStatus) {
-        allMediaItems.filter { downloadStatus[it.id] == "Completed" }
+    val authUser = viewModel.auth?.currentUser
+    val displayNick = remember(authUser, isUserLoggedIn) {
+        authUser?.displayName ?: context.getSharedPreferences("wholetv_prefs", android.content.Context.MODE_PRIVATE)
+            .getString("user_display_name", "Legendary Streamer") ?: "Legendary Streamer"
+    }
+    val displayPhotoUrl = remember(authUser, isUserLoggedIn) {
+        authUser?.photoUrl?.toString() ?: context.getSharedPreferences("wholetv_prefs", android.content.Context.MODE_PRIVATE)
+            .getString("user_photo_url", "") ?: ""
+    }
+
+    // Profile editing states
+    var showEditProfileDialog by remember { mutableStateOf(false) }
+    var editDisplayName by remember { mutableStateOf(displayNick) }
+    var editUsername by remember { mutableStateOf(userUsername) }
+    var editBio by remember { mutableStateOf(userBio) }
+
+    // Selected offline media to play
+    var activeOfflineVideoUrl by remember { mutableStateOf<String?>(null) }
+
+    // Profile Image Picker Launcher
+    val profileImagePickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickVisualMedia()
+    ) { uri ->
+        if (uri != null) {
+            Toast.makeText(context, "Uploading profile picture...", Toast.LENGTH_SHORT).show()
+            viewModel.uploadProfilePicture(uri, { newUrl ->
+                Toast.makeText(context, "Profile picture updated successfully!", Toast.LENGTH_SHORT).show()
+            }, { err ->
+                Toast.makeText(context, "Upload failed: $err", Toast.LENGTH_LONG).show()
+            })
+        }
+    }
+
+    // Filter items showing in Download list (Completed, Downloading, Paused, Failed)
+    val downloadList = remember(allMediaItems, downloadStatus) {
+        allMediaItems.filter { 
+            val status = downloadStatus[it.id] ?: "None"
+            status == "Completed" || status == "Downloading" || status == "Paused" || status == "Failed"
+        }
     }
 
     Column(
@@ -1301,7 +1356,8 @@ fun MeProfileScreen(viewModel: MediaViewModel) {
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(top = 40.dp, start = 16.dp, end = 16.dp, bottom = 8.dp),
-            verticalAlignment = Alignment.CenterVertically
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
         ) {
             Text(
                 text = "My wholeTV",
@@ -1309,77 +1365,252 @@ fun MeProfileScreen(viewModel: MediaViewModel) {
                 fontSize = 22.sp,
                 fontWeight = FontWeight.Bold
             )
-        }
-
-        Spacer(modifier = Modifier.height(16.dp))
-
-        // Profile Avatar Representation
-        Box(
-            modifier = Modifier
-                .size(90.dp)
-                .clip(CircleShape)
-                .background(MovieRed.copy(alpha = 0.15f))
-                .border(2.dp, MovieRed, CircleShape),
-            contentAlignment = Alignment.Center
-        ) {
-            Icon(
-                imageVector = Icons.Filled.Person,
-                contentDescription = null,
-                tint = MovieRed,
-                modifier = Modifier.size(48.dp)
-            )
+            if (isUserLoggedIn) {
+                TextButton(onClick = { viewModel.logoutUser() }) {
+                    Text("Logout", color = MovieRed, fontWeight = FontWeight.Bold)
+                }
+            }
         }
 
         Spacer(modifier = Modifier.height(12.dp))
 
-        Text(
-            text = "Legendary Streamer",
-            color = SoftWhite,
-            fontSize = 18.sp,
-            fontWeight = FontWeight.Bold
-        )
-        Text(
-            text = "Active Community Curator",
-            color = CinemaGold,
-            fontSize = 12.sp,
-            fontWeight = FontWeight.SemiBold
-        )
+        if (!isUserLoggedIn) {
+            // Modern Authentication Card UI
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                colors = CardDefaults.cardColors(containerColor = DarkSurface),
+                border = BorderStroke(1.dp, DeepGrey)
+            ) {
+                Column(
+                    modifier = Modifier.padding(20.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text(
+                        text = if (isSignUpMode) "Create Account" else "Welcome Back",
+                        color = SoftWhite,
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = if (isSignUpMode) "Sign up to upload, stream & download offline" else "Log in to access your streaming feed",
+                        color = MutedSlate,
+                        fontSize = 12.sp,
+                        textAlign = TextAlign.Center
+                    )
+                    
+                    Spacer(modifier = Modifier.height(16.dp))
 
-        Spacer(modifier = Modifier.height(24.dp))
+                    if (authError.isNotEmpty()) {
+                        Text(
+                            text = authError,
+                            color = MovieRed,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(bottom = 8.dp)
+                        )
+                    }
 
-        // Stats row
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 24.dp),
-            horizontalArrangement = Arrangement.SpaceEvenly
-        ) {
+                    OutlinedTextField(
+                        value = emailInput,
+                        onValueChange = { emailInput = it },
+                        label = { Text("Email Address", color = MutedSlate) },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = MovieRed,
+                            unfocusedBorderColor = DeepGrey,
+                            focusedTextColor = SoftWhite,
+                            unfocusedTextColor = SoftWhite
+                        )
+                    )
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    OutlinedTextField(
+                        value = passwordInput,
+                        onValueChange = { passwordInput = it },
+                        label = { Text("Password", color = MutedSlate) },
+                        modifier = Modifier.fillMaxWidth(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = MovieRed,
+                            unfocusedBorderColor = DeepGrey,
+                            focusedTextColor = SoftWhite,
+                            unfocusedTextColor = SoftWhite
+                        )
+                    )
+
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    Button(
+                        onClick = {
+                            if (emailInput.isBlank() || passwordInput.isBlank()) {
+                                authError = "Please fill in all credentials."
+                                return@Button
+                            }
+                            authError = ""
+                            if (isSignUpMode) {
+                                viewModel.signUpUser(emailInput, passwordInput, {
+                                    Toast.makeText(context, "Signed up successfully!", Toast.LENGTH_SHORT).show()
+                                }, { err ->
+                                    authError = err
+                                })
+                            } else {
+                                viewModel.loginUser(emailInput, passwordInput, {
+                                    Toast.makeText(context, "Logged in successfully!", Toast.LENGTH_SHORT).show()
+                                }, { err ->
+                                    authError = err
+                                })
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = MovieRed),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(if (isSignUpMode) "Sign Up" else "Log In", color = Color.White, fontWeight = FontWeight.Bold)
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    TextButton(onClick = { isSignUpMode = !isSignUpMode }) {
+                        Text(
+                            text = if (isSignUpMode) "Already have an account? Log In" else "Don't have an account? Sign Up",
+                            color = CinemaGold,
+                            fontSize = 12.sp
+                        )
+                    }
+                }
+            }
+        } else {
+            // Interactive User Profile Card UI
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                // Editable Profile Avatar
+                Box(
+                    modifier = Modifier
+                        .size(100.dp)
+                        .clip(CircleShape)
+                        .background(DarkSurface)
+                        .border(2.dp, MovieRed, CircleShape)
+                        .clickable {
+                            profileImagePickerLauncher.launch(
+                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                            )
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    if (displayPhotoUrl.isNotEmpty()) {
+                        AsyncImage(
+                            model = displayPhotoUrl,
+                            contentDescription = "Profile Picture",
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    } else {
+                        Icon(
+                            imageVector = Icons.Filled.Person,
+                            contentDescription = "Change profile picture",
+                            tint = MovieRed,
+                            modifier = Modifier.size(54.dp)
+                        )
+                    }
+                    
+                    // Small Edit Camera overlay icon
+                    Box(
+                        modifier = Modifier
+                            .size(24.dp)
+                            .align(Alignment.BottomEnd)
+                            .background(MovieRed, CircleShape),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.PhotoCamera,
+                            contentDescription = "Edit photo",
+                            tint = Color.White,
+                            modifier = Modifier.size(14.dp)
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+
                 Text(
-                    text = "${allMediaItems.size}",
+                    text = displayNick,
                     color = SoftWhite,
-                    fontSize = 18.sp,
+                    fontSize = 20.sp,
                     fontWeight = FontWeight.Bold
                 )
-                Text(text = "Mix Shows", color = MutedSlate, fontSize = 12.sp)
-            }
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Text(
-                    text = "${downloadedItems.size}",
-                    color = SoftWhite,
-                    fontSize = 18.sp,
-                    fontWeight = FontWeight.Bold
-                )
-                Text(text = "Downloaded", color = MutedSlate, fontSize = 12.sp)
-            }
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Text(
-                    text = "120MB/s",
+                    text = userUsername,
                     color = CinemaGold,
-                    fontSize = 18.sp,
-                    fontWeight = FontWeight.Bold
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold
                 )
-                Text(text = "Max Bandwidth", color = MutedSlate, fontSize = 12.sp)
+
+                Spacer(modifier = Modifier.height(6.dp))
+
+                Text(
+                    text = userBio,
+                    color = MutedSlate,
+                    fontSize = 12.sp,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.padding(horizontal = 32.dp)
+                )
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                Button(
+                    onClick = {
+                        editDisplayName = displayNick
+                        editUsername = userUsername
+                        editBio = userBio
+                        showEditProfileDialog = true
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = DarkSurface),
+                    border = BorderStroke(1.dp, DeepGrey)
+                ) {
+                    Icon(imageVector = Icons.Default.Edit, contentDescription = null, tint = SoftWhite, modifier = Modifier.size(14.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Edit Profile Details", color = SoftWhite, fontSize = 12.sp)
+                }
+
+                Spacer(modifier = Modifier.height(24.dp))
+
+                // Stats Row
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 24.dp),
+                    horizontalArrangement = Arrangement.SpaceEvenly
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text(
+                            text = "${allMediaItems.size}",
+                            color = SoftWhite,
+                            fontSize = 18.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(text = "Mix Shows", color = MutedSlate, fontSize = 12.sp)
+                    }
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text(
+                            text = "${downloadList.filter { downloadStatus[it.id] == "Completed" }.size}",
+                            color = SoftWhite,
+                            fontSize = 18.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(text = "Downloaded", color = MutedSlate, fontSize = 12.sp)
+                    }
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text(
+                            text = "100%",
+                            color = CinemaGold,
+                            fontSize = 18.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(text = "Sync Health", color = MutedSlate, fontSize = 12.sp)
+                    }
+                }
             }
         }
 
@@ -1387,27 +1618,33 @@ fun MeProfileScreen(viewModel: MediaViewModel) {
 
         SectionHeader(title = "My Offline Downloads")
 
-        if (downloadedItems.isEmpty()) {
+        if (downloadList.isEmpty()) {
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
+                    .padding(horizontal = 16.dp)
                     .height(150.dp)
-                    .padding(16.dp)
                     .background(DarkSurface, RoundedCornerShape(8.dp)),
                 contentAlignment = Alignment.Center
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     Icon(
-                        imageVector = Icons.Filled.DownloadDone,
+                        imageVector = Icons.Filled.CloudDownload,
                         contentDescription = null,
                         tint = MutedSlate,
-                        modifier = Modifier.size(32.dp)
+                        modifier = Modifier.size(36.dp)
                     )
-                    Spacer(modifier = Modifier.height(6.dp))
+                    Spacer(modifier = Modifier.height(8.dp))
                     Text(
                         text = "No offline media downloaded yet.",
                         color = MutedSlate,
                         fontSize = 13.sp,
+                        textAlign = TextAlign.Center
+                    )
+                    Text(
+                        text = "Click download inside any video to store offline.",
+                        color = MutedSlate.copy(alpha = 0.6f),
+                        fontSize = 11.sp,
                         textAlign = TextAlign.Center
                     )
                 }
@@ -1419,48 +1656,210 @@ fun MeProfileScreen(viewModel: MediaViewModel) {
                     .padding(horizontal = 16.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                downloadedItems.forEach { item ->
+                downloadList.forEach { item ->
+                    val status = downloadStatus[item.id] ?: "None"
+                    val progress = downloadProgress[item.id] ?: 0f
+
                     Card(
                         modifier = Modifier.fillMaxWidth(),
                         colors = CardDefaults.cardColors(containerColor = DarkSurface),
                         border = BorderStroke(1.dp, DeepGrey)
                     ) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(12.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(
-                                imageVector = Icons.Filled.Movie,
-                                contentDescription = null,
-                                tint = MovieRed,
-                                modifier = Modifier.size(36.dp)
-                            )
-                            Spacer(modifier = Modifier.width(16.dp))
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = item.title,
-                                    color = SoftWhite,
-                                    fontSize = 14.sp,
-                                    fontWeight = FontWeight.Bold
-                                )
-                                Text(
-                                    text = "${item.qualities} | ${item.languages}",
-                                    color = MutedSlate,
-                                    fontSize = 11.sp
-                                )
-                            }
-                            IconButton(onClick = { /* Simulated play */ }) {
+                        Column(modifier = Modifier.padding(12.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
                                 Icon(
-                                    imageVector = Icons.Filled.PlayCircle,
-                                    contentDescription = "Play",
+                                    imageVector = Icons.Filled.Movie,
+                                    contentDescription = null,
                                     tint = MovieRed,
-                                    modifier = Modifier.size(28.dp)
+                                    modifier = Modifier.size(36.dp)
                                 )
+                                Spacer(modifier = Modifier.width(16.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = item.title,
+                                        color = SoftWhite,
+                                        fontSize = 14.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Text(
+                                        text = "Status: $status | ${item.qualities}",
+                                        color = if (status == "Failed") MovieRed else CinemaGold,
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                }
+
+                                // Interactive Action Buttons based on state
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    if (status == "Downloading") {
+                                        IconButton(onClick = { viewModel.pauseDownload(item.id) }) {
+                                            Icon(imageVector = Icons.Filled.Pause, contentDescription = "Pause", tint = SoftWhite)
+                                        }
+                                    } else if (status == "Paused" || status == "Failed") {
+                                        IconButton(onClick = { viewModel.resumeDownload(item.id) }) {
+                                            Icon(imageVector = Icons.Filled.PlayArrow, contentDescription = "Resume", tint = SoftWhite)
+                                        }
+                                    } else if (status == "Completed") {
+                                        IconButton(onClick = {
+                                            // Play offline local file directly!
+                                            val localFile = File(item.localFilePath ?: "")
+                                            if (localFile.exists()) {
+                                                activeOfflineVideoUrl = localFile.absolutePath
+                                            } else {
+                                                Toast.makeText(context, "Local file not found! Re-downloading required.", Toast.LENGTH_SHORT).show()
+                                            }
+                                        }) {
+                                            Icon(imageVector = Icons.Filled.PlayCircle, contentDescription = "Play Offline", tint = MovieRed, modifier = Modifier.size(28.dp))
+                                        }
+                                    }
+
+                                    // Delete / cancel button
+                                    IconButton(onClick = { viewModel.deleteDownload(item.id) }) {
+                                        Icon(imageVector = Icons.Filled.Delete, contentDescription = "Delete download", tint = MutedSlate)
+                                    }
+                                }
+                            }
+
+                            // Progress Bar for downloading/paused states
+                            if (status == "Downloading" || status == "Paused") {
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    LinearProgressIndicator(
+                                        progress = { progress },
+                                        color = MovieRed,
+                                        trackColor = Color.White.copy(alpha = 0.1f),
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .height(4.dp)
+                                            .clip(RoundedCornerShape(2.dp))
+                                    )
+                                    Spacer(modifier = Modifier.width(10.dp))
+                                    Text(
+                                        text = "${(progress * 100).toInt()}%",
+                                        color = SoftWhite,
+                                        fontSize = 10.sp,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
                             }
                         }
                     }
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(60.dp))
+    }
+
+    // Edit Profile Details Dialog
+    if (showEditProfileDialog) {
+        AlertDialog(
+            onDismissRequest = { showEditProfileDialog = false },
+            title = { Text("Edit Profile Info", color = SoftWhite, fontWeight = FontWeight.Bold) },
+            containerColor = PremiumDarkBg,
+            text = {
+                Column {
+                    OutlinedTextField(
+                        value = editDisplayName,
+                        onValueChange = { editDisplayName = it },
+                        label = { Text("Display Nickname") },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = MovieRed,
+                            unfocusedBorderColor = DeepGrey,
+                            focusedTextColor = SoftWhite,
+                            unfocusedTextColor = SoftWhite
+                        )
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = editUsername,
+                        onValueChange = { editUsername = it },
+                        label = { Text("Username handle") },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = MovieRed,
+                            unfocusedBorderColor = DeepGrey,
+                            focusedTextColor = SoftWhite,
+                            unfocusedTextColor = SoftWhite
+                        )
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = editBio,
+                        onValueChange = { editBio = it },
+                        label = { Text("Bio description") },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = MovieRed,
+                            unfocusedBorderColor = DeepGrey,
+                            focusedTextColor = SoftWhite,
+                            unfocusedTextColor = SoftWhite
+                        )
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        viewModel.updateUserProfile(
+                            displayName = editDisplayName,
+                            username = editUsername,
+                            bio = editBio,
+                            onSuccess = {
+                                showEditProfileDialog = false
+                                Toast.makeText(context, "Profile details updated!", Toast.LENGTH_SHORT).show()
+                            },
+                            onFailure = { err ->
+                                Toast.makeText(context, err, Toast.LENGTH_LONG).show()
+                            }
+                        )
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = MovieRed)
+                ) {
+                    Text("Save Changes", color = Color.White)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showEditProfileDialog = false }) {
+                    Text("Cancel", color = MutedSlate)
+                }
+            }
+        )
+    }
+
+    // Overlay dialog to play offline download videos
+    if (activeOfflineVideoUrl != null) {
+        Dialog(
+            onDismissRequest = { activeOfflineVideoUrl = null },
+            properties = DialogProperties(usePlatformDefaultWidth = false)
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black)
+            ) {
+                VideoPlayer(
+                    videoUrl = activeOfflineVideoUrl!!,
+                    modifier = Modifier.fillMaxSize()
+                )
+
+                IconButton(
+                    onClick = { activeOfflineVideoUrl = null },
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .padding(top = 40.dp, start = 16.dp)
+                        .background(Color.Black.copy(alpha = 0.5f), CircleShape)
+                ) {
+                    Icon(imageVector = Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Close player", tint = Color.White)
                 }
             }
         }
@@ -2674,14 +3073,40 @@ fun VideoPlayer(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
+    val activity = context as? android.app.Activity
+    val audioManager = remember { context.getSystemService(android.content.Context.AUDIO_SERVICE) as android.media.AudioManager }
+
     val safeVideoUrl = remember(videoUrl) {
         if (videoUrl.isBlank() || videoUrl.startsWith("http://placeholder") || (!videoUrl.startsWith("http") && !videoUrl.startsWith("content"))) {
-            // Highly stable sample video hosted on Google Storage for smooth playback testing
             "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
         } else {
             videoUrl
         }
     }
+
+    // Custom States
+    var isPlayingState by remember { mutableStateOf(true) }
+    var isFullscreen by remember { mutableStateOf(false) }
+    var currentSpeed by remember { mutableStateOf(1.0f) }
+    var resizeMode by remember { mutableStateOf(androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT) }
+    var isControlsVisible by remember { mutableStateOf(true) }
+    var isLocked by remember { mutableStateOf(false) }
+    var currentPosition by remember { mutableStateOf(0L) }
+    var duration by remember { mutableStateOf(0L) }
+    var isMuted by remember { mutableStateOf(false) }
+    
+    // Gestural Overlays
+    var showBrightnessOverlay by remember { mutableStateOf(false) }
+    var brightnessValue by remember { mutableStateOf(0.5f) }
+    var showVolumeOverlay by remember { mutableStateOf(false) }
+    var volumeValue by remember { mutableStateOf(0.5f) }
+    var doubleTapText by remember { mutableStateOf("") }
+    var showDoubleTapOverlay by remember { mutableStateOf(false) }
+
+    // Popup settings
+    var showSpeedMenu by remember { mutableStateOf(false) }
+    var showQualityMenu by remember { mutableStateOf(false) }
+    var selectedQuality by remember { mutableStateOf("Auto") }
 
     val exoPlayer = remember(safeVideoUrl) {
         try {
@@ -2690,6 +3115,14 @@ fun VideoPlayer(
                 setMediaItem(mediaItem)
                 prepare()
                 playWhenReady = true
+                
+                // Seek to resume if there's any last saved position
+                // Let's check shared preferences
+                val prefs = context.getSharedPreferences("wholetv_playback_resume", android.content.Context.MODE_PRIVATE)
+                val savedPos = prefs.getLong(safeVideoUrl, 0L)
+                if (savedPos > 0L) {
+                    seekTo(savedPos)
+                }
             }
         } catch (e: Exception) {
             android.util.Log.e("VideoPlayer", "Failed to initialize ExoPlayer safely", e)
@@ -2697,34 +3130,542 @@ fun VideoPlayer(
         }
     }
 
+    // Save playback position periodically and on dispose
     DisposableEffect(exoPlayer) {
         onDispose {
-            exoPlayer?.release()
+            exoPlayer?.let {
+                val prefs = context.getSharedPreferences("wholetv_playback_resume", android.content.Context.MODE_PRIVATE)
+                prefs.edit().putLong(safeVideoUrl, it.currentPosition).apply()
+                it.release()
+            }
+            // Reset orientation to portrait on exit
+            activity?.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
         }
     }
 
-    if (exoPlayer != null) {
-        AndroidView(
-            factory = { ctx ->
-                androidx.media3.ui.PlayerView(ctx).apply {
-                    player = exoPlayer
-                    useController = true
-                    setBackgroundColor(android.graphics.Color.BLACK)
-                }
-            },
-            modifier = modifier
-        )
-    } else {
-        Box(
-            modifier = modifier.background(Color.Black),
-            contentAlignment = androidx.compose.ui.Alignment.Center
-        ) {
-            Text(
-                text = "Unable to play video stream",
-                color = Color.White,
-                fontWeight = FontWeight.Bold
+    // Sync play state
+    LaunchedEffect(exoPlayer) {
+        while (exoPlayer != null) {
+            currentPosition = exoPlayer.currentPosition
+            duration = exoPlayer.duration.coerceAtLeast(0L)
+            isPlayingState = exoPlayer.isPlaying
+            delay(250)
+        }
+    }
+
+    // Auto-hide controls
+    LaunchedEffect(isControlsVisible, isLocked) {
+        if (isControlsVisible && !isLocked) {
+            delay(3500)
+            isControlsVisible = false
+        }
+    }
+
+    Box(
+        modifier = modifier
+            .background(Color.Black)
+            .pointerInput(isLocked) {
+                detectTapGestures(
+                    onTap = {
+                        isControlsVisible = !isControlsVisible
+                    },
+                    onDoubleTap = { offset ->
+                        if (isLocked) return@detectTapGestures
+                        exoPlayer?.let { player ->
+                            val width = size.width
+                            if (offset.x < width / 2) {
+                                // Rewind 10s
+                                val target = (player.currentPosition - 10000).coerceAtLeast(0)
+                                player.seekTo(target)
+                                doubleTapText = "-10s"
+                            } else {
+                                // Fast-forward 10s
+                                val target = (player.currentPosition + 10000).coerceAtMost(player.duration)
+                                player.seekTo(target)
+                                doubleTapText = "+10s"
+                            }
+                            showDoubleTapOverlay = true
+                        }
+                    }
+                )
+            }
+            .pointerInput(isLocked) {
+                if (isLocked) return@pointerInput
+                detectVerticalDragGestures(
+                    onDragStart = { offset ->
+                        val width = size.width
+                        if (offset.x < width / 2) {
+                            showBrightnessOverlay = true
+                            showVolumeOverlay = false
+                            // Get current brightness
+                            val attrs = activity?.window?.attributes
+                            brightnessValue = attrs?.screenBrightness?.takeIf { it >= 0 } ?: 0.5f
+                        } else {
+                            showVolumeOverlay = true
+                            showBrightnessOverlay = false
+                            // Get volume
+                            val max = audioManager.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC).toFloat()
+                            val cur = audioManager.getStreamVolume(android.media.AudioManager.STREAM_MUSIC).toFloat()
+                            volumeValue = if (max > 0) cur / max else 0f
+                        }
+                    },
+                    onVerticalDrag = { change, dragAmount ->
+                        val width = size.width
+                        val isLeft = change.position.x < width / 2
+                        val delta = -dragAmount / 500f // scroll up increases, scroll down decreases
+                        
+                        if (isLeft) {
+                            brightnessValue = (brightnessValue + delta).coerceIn(0.01f, 1.0f)
+                            activity?.let { act ->
+                                val lp = act.window.attributes
+                                lp.screenBrightness = brightnessValue
+                                act.window.attributes = lp
+                            }
+                        } else {
+                            volumeValue = (volumeValue + delta).coerceIn(0f, 1.0f)
+                            val max = audioManager.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC)
+                            val targetVol = (volumeValue * max).toInt().coerceIn(0, max)
+                            audioManager.setStreamVolume(android.media.AudioManager.STREAM_MUSIC, targetVol, 0)
+                        }
+                    },
+                    onDragEnd = {
+                        showBrightnessOverlay = false
+                        showVolumeOverlay = false
+                    }
+                )
+            }
+    ) {
+        if (exoPlayer != null) {
+            AndroidView(
+                factory = { ctx ->
+                    androidx.media3.ui.PlayerView(ctx).apply {
+                        player = exoPlayer
+                        useController = false
+                        setBackgroundColor(android.graphics.Color.BLACK)
+                    }
+                },
+                update = { view ->
+                    view.resizeMode = resizeMode
+                },
+                modifier = Modifier.fillMaxSize()
             )
         }
+
+        // Animated double tap visual indicator overlay
+        AnimatedVisibility(
+            visible = showDoubleTapOverlay,
+            enter = fadeIn(animationSpec = tween(150)) + scaleIn(),
+            exit = fadeOut(animationSpec = tween(150)) + scaleOut(),
+            modifier = Modifier.align(Alignment.Center)
+        ) {
+            Box(
+                modifier = Modifier
+                    .background(Color.Black.copy(alpha = 0.7f), CircleShape)
+                    .size(90.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Icon(
+                        imageVector = if (doubleTapText.startsWith("-")) Icons.Default.KeyboardArrowLeft else Icons.Default.KeyboardArrowRight,
+                        contentDescription = null,
+                        tint = Color.White,
+                        modifier = Modifier.size(36.dp)
+                    )
+                    Text(
+                        text = doubleTapText,
+                        color = Color.White,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 14.sp
+                    )
+                }
+            }
+            LaunchedEffect(showDoubleTapOverlay) {
+                if (showDoubleTapOverlay) {
+                    delay(800)
+                    showDoubleTapOverlay = false
+                }
+            }
+        }
+
+        // Gesture overlays for brightness and volume
+        if (showBrightnessOverlay) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.CenterStart)
+                    .padding(start = 24.dp)
+                    .background(Color.Black.copy(alpha = 0.6f), RoundedCornerShape(12.dp))
+                    .padding(vertical = 16.dp, horizontal = 12.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Icon(imageVector = Icons.Default.Brightness5, contentDescription = null, tint = Color.Yellow)
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Box(
+                        modifier = Modifier
+                            .width(6.dp)
+                            .height(100.dp)
+                            .background(Color.White.copy(alpha = 0.3f), RoundedCornerShape(3.dp))
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .fillMaxHeight(brightnessValue)
+                                .align(Alignment.BottomStart)
+                                .background(MovieRed, RoundedCornerShape(3.dp))
+                        )
+                    }
+                }
+            }
+        }
+
+        if (showVolumeOverlay) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.CenterEnd)
+                    .padding(end = 24.dp)
+                    .background(Color.Black.copy(alpha = 0.6f), RoundedCornerShape(12.dp))
+                    .padding(vertical = 16.dp, horizontal = 12.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Icon(imageVector = if (volumeValue == 0f) Icons.Default.VolumeMute else Icons.Default.VolumeUp, contentDescription = null, tint = MovieRed)
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Box(
+                        modifier = Modifier
+                            .width(6.dp)
+                            .height(100.dp)
+                            .background(Color.White.copy(alpha = 0.3f), RoundedCornerShape(3.dp))
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .fillMaxHeight(volumeValue)
+                                .align(Alignment.BottomStart)
+                                .background(MovieRed, RoundedCornerShape(3.dp))
+                        )
+                    }
+                }
+            }
+        }
+
+        // Custom controller overlay
+        AnimatedVisibility(
+            visible = isControlsVisible,
+            enter = fadeIn(animationSpec = tween(250)),
+            exit = fadeOut(animationSpec = tween(250))
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.5f))
+            ) {
+                if (isLocked) {
+                    // Lock Screen Icon Mode
+                    IconButton(
+                        onClick = { isLocked = false; isControlsVisible = true },
+                        modifier = Modifier
+                            .padding(16.dp)
+                            .align(Alignment.Center)
+                            .background(Color.Black.copy(alpha = 0.6f), CircleShape)
+                            .size(60.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Lock,
+                            contentDescription = "Unlock screen controls",
+                            tint = MovieRed,
+                            modifier = Modifier.size(28.dp)
+                        )
+                    }
+                } else {
+                    // Full Premium Controls Overlay
+                    // Top Bar
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .align(Alignment.TopCenter)
+                            .padding(16.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            IconButton(
+                                onClick = {
+                                    // Fullscreen toggle
+                                    isFullscreen = !isFullscreen
+                                    activity?.requestedOrientation = if (isFullscreen) {
+                                        android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+                                    } else {
+                                        android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                                    }
+                                },
+                                modifier = Modifier.background(Color.Black.copy(alpha = 0.4f), CircleShape)
+                            ) {
+                                Icon(
+                                    imageVector = if (isFullscreen) Icons.Default.FullscreenExit else Icons.Default.Fullscreen,
+                                    contentDescription = "Toggle Fullscreen",
+                                    tint = Color.White
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = "Premium Cinema Player",
+                                color = Color.White,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 16.sp
+                            )
+                        }
+
+                        // Right Top actions (Speed, Quality, Lock)
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            // Aspect ratio button
+                            IconButton(
+                                onClick = {
+                                    resizeMode = when (resizeMode) {
+                                        androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT -> androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+                                        androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_ZOOM -> androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FILL
+                                        else -> androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT
+                                    }
+                                    val modeName = when (resizeMode) {
+                                        androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT -> "Fit"
+                                        androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_ZOOM -> "Zoom (Crop)"
+                                        else -> "Stretch"
+                                    }
+                                    Toast.makeText(context, "Aspect Ratio: $modeName", Toast.LENGTH_SHORT).show()
+                                },
+                                modifier = Modifier.background(Color.Black.copy(alpha = 0.4f), CircleShape)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.AspectRatio,
+                                    contentDescription = "Aspect Ratio",
+                                    tint = Color.White
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(6.dp))
+
+                            // Speed selection
+                            Box {
+                                IconButton(
+                                    onClick = { showSpeedMenu = true },
+                                    modifier = Modifier.background(Color.Black.copy(alpha = 0.4f), CircleShape)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Speed,
+                                        contentDescription = "Playback speed",
+                                        tint = Color.White
+                                    )
+                                }
+                                DropdownMenu(
+                                    expanded = showSpeedMenu,
+                                    onDismissRequest = { showSpeedMenu = false },
+                                    modifier = Modifier.background(PremiumDarkBg)
+                                ) {
+                                    listOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f).forEach { speed ->
+                                        DropdownMenuItem(
+                                            text = { Text("${speed}x", color = if (currentSpeed == speed) MovieRed else SoftWhite) },
+                                            onClick = {
+                                                currentSpeed = speed
+                                                exoPlayer?.setPlaybackSpeed(speed)
+                                                showSpeedMenu = false
+                                            }
+                                        )
+                                    }
+                                }
+                            }
+                            Spacer(modifier = Modifier.width(6.dp))
+
+                            // Quality selection
+                            Box {
+                                IconButton(
+                                    onClick = { showQualityMenu = true },
+                                    modifier = Modifier.background(Color.Black.copy(alpha = 0.4f), CircleShape)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Settings,
+                                        contentDescription = "Quality",
+                                        tint = Color.White
+                                    )
+                                }
+                                DropdownMenu(
+                                    expanded = showQualityMenu,
+                                    onDismissRequest = { showQualityMenu = false },
+                                    modifier = Modifier.background(PremiumDarkBg)
+                                ) {
+                                    listOf("Auto", "1080p HD", "720p HD", "480p").forEach { quality ->
+                                        DropdownMenuItem(
+                                            text = { Text(quality, color = if (selectedQuality == quality) MovieRed else SoftWhite) },
+                                            onClick = {
+                                                selectedQuality = quality
+                                                showQualityMenu = false
+                                                Toast.makeText(context, "Streaming quality: $quality", Toast.LENGTH_SHORT).show()
+                                            }
+                                        )
+                                    }
+                                }
+                            }
+                            Spacer(modifier = Modifier.width(6.dp))
+
+                            // Lock screen button
+                            IconButton(
+                                onClick = { isLocked = true },
+                                modifier = Modifier.background(Color.Black.copy(alpha = 0.4f), CircleShape)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.LockOpen,
+                                    contentDescription = "Lock controls",
+                                    tint = Color.White
+                                )
+                            }
+                        }
+                    }
+
+                    // Middle playback actions (Previous, Rewind, Play/Pause, FastForward, Next)
+                    Row(
+                        modifier = Modifier.align(Alignment.Center),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(20.dp)
+                    ) {
+                        IconButton(
+                            onClick = {
+                                exoPlayer?.let {
+                                    val target = (it.currentPosition - 10000).coerceAtLeast(0L)
+                                    it.seekTo(target)
+                                }
+                            },
+                            modifier = Modifier
+                                .background(Color.Black.copy(alpha = 0.6f), CircleShape)
+                                .size(48.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Replay10,
+                                contentDescription = "Rewind 10s",
+                                tint = Color.White,
+                                modifier = Modifier.size(24.dp)
+                            )
+                        }
+
+                        // Play/Pause Large central button
+                        IconButton(
+                            onClick = {
+                                exoPlayer?.let {
+                                    if (it.isPlaying) {
+                                        it.pause()
+                                    } else {
+                                        it.play()
+                                    }
+                                }
+                            },
+                            modifier = Modifier
+                                .background(MovieRed, CircleShape)
+                                .size(68.dp)
+                        ) {
+                            Icon(
+                                imageVector = if (isPlayingState) Icons.Default.Pause else Icons.Default.PlayArrow,
+                                contentDescription = if (isPlayingState) "Pause" else "Play",
+                                tint = Color.White,
+                                modifier = Modifier.size(36.dp)
+                            )
+                        }
+
+                        IconButton(
+                            onClick = {
+                                exoPlayer?.let {
+                                    val target = (it.currentPosition + 10000).coerceAtMost(it.duration)
+                                    it.seekTo(target)
+                                }
+                            },
+                            modifier = Modifier
+                                .background(Color.Black.copy(alpha = 0.6f), CircleShape)
+                                .size(48.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Forward10,
+                                contentDescription = "Forward 10s",
+                                tint = Color.White,
+                                modifier = Modifier.size(24.dp)
+                            )
+                        }
+                    }
+
+                    // Bottom progress bar and controls
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .align(Alignment.BottomCenter)
+                            .padding(16.dp)
+                    ) {
+                        // Progress Slider
+                        Slider(
+                            value = if (duration > 0) currentPosition.toFloat() / duration.toFloat() else 0f,
+                            onValueChange = { progress ->
+                                exoPlayer?.let {
+                                    val target = (progress * duration).toLong()
+                                    it.seekTo(target)
+                                    currentPosition = target
+                                }
+                            },
+                            colors = SliderDefaults.colors(
+                                thumbColor = MovieRed,
+                                activeTrackColor = MovieRed,
+                                inactiveTrackColor = Color.White.copy(alpha = 0.3f)
+                            ),
+                            modifier = Modifier.fillMaxWidth()
+                        )
+
+                        // Duration labels and speed/mute details
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = formatTime(currentPosition) + " / " + formatTime(duration),
+                                color = SoftWhite,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+
+                            // Mute option
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                IconButton(
+                                    onClick = {
+                                        isMuted = !isMuted
+                                        exoPlayer?.volume = if (isMuted) 0f else 1.0f
+                                    }
+                                ) {
+                                    Icon(
+                                        imageVector = if (isMuted) Icons.Default.VolumeOff else Icons.Default.VolumeUp,
+                                        contentDescription = "Mute",
+                                        tint = Color.White,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
+                                Text(
+                                    text = "Auto Quality",
+                                    color = SoftWhite,
+                                    fontSize = 11.sp,
+                                    modifier = Modifier
+                                        .background(MovieRed.copy(alpha = 0.2f), RoundedCornerShape(4.dp))
+                                        .padding(horizontal = 6.dp, vertical = 2.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Utility to format ExoPlayer position (ms) to string "00:00"
+fun formatTime(ms: Long): String {
+    val totalSecs = ms / 1000
+    val hours = totalSecs / 3600
+    val minutes = (totalSecs % 3600) / 60
+    val seconds = totalSecs % 60
+    return if (hours > 0) {
+        String.format("%02d:%02d:%02d", hours, minutes, seconds)
+    } else {
+        String.format("%02d:%02d", minutes, seconds)
     }
 }
 
