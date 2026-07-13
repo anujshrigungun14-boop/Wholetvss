@@ -24,5 +24,8 @@ data class MediaItem(
     val videoUrl: String = "",
     val firestoreId: String = "",
     val uploaderId: String = "",
-    val timestamp: Long = System.currentTimeMillis()
+    val timestamp: Long = System.currentTimeMillis(),
+    val genre: String = "Action",
+    val uploaderName: String = "Anonymous",
+    val watchTime: Long = 0
 )

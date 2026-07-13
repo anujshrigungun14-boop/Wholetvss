@@ -67,6 +67,12 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         
+        try {
+            com.google.firebase.FirebaseApp.initializeApp(this)
+        } catch (e: Exception) {
+            android.util.Log.e("FirebaseInit", "Manual Firebase initialization skipped or failed", e)
+        }
+        
         // Build Database & Repository
         val database = AppDatabase.getDatabase(this)
         val repository = MediaRepository(database.mediaDao())
@@ -98,7 +104,7 @@ class MainActivity : ComponentActivity() {
                             "Home" -> HomeScreen(viewModel = viewModel)
                             "Streaming" -> StreamingScreen(viewModel = viewModel)
                             "Categories" -> CategoriesScreen(viewModel = viewModel)
-                            "Community" -> CommunityScreen()
+                            "Search" -> SearchScreen(viewModel = viewModel)
                             "Me" -> MeProfileScreen(viewModel = viewModel)
                         }
                     }
@@ -120,7 +126,7 @@ fun WholeTVBottomBar(
         NavigationItem("Home", Icons.Filled.Home),
         NavigationItem("Streaming", Icons.Filled.PlayArrow),
         NavigationItem("Categories", Icons.Filled.Folder),
-        NavigationItem("Community", Icons.Filled.Group),
+        NavigationItem("Search", Icons.Filled.Search),
         NavigationItem("Me", Icons.Filled.Person)
     )
 
@@ -173,6 +179,12 @@ fun HomeScreen(viewModel: MediaViewModel) {
     val slides by viewModel.slides.collectAsStateWithLifecycle()
     val selectedMediaItem by viewModel.selectedMediaItem.collectAsStateWithLifecycle()
     
+    val trendingItems by viewModel.trendingItems.collectAsStateWithLifecycle()
+    val latestUploads by viewModel.latestUploads.collectAsStateWithLifecycle()
+    val recommendedItems by viewModel.recommendedItems.collectAsStateWithLifecycle()
+    val popularThisWeek by viewModel.popularThisWeek.collectAsStateWithLifecycle()
+    val continueWatching by viewModel.continueWatching.collectAsStateWithLifecycle()
+    
     var isUploadOpen by remember { mutableStateOf(false) }
     var searchFocused by remember { mutableStateOf(false) }
 
@@ -211,22 +223,19 @@ fun HomeScreen(viewModel: MediaViewModel) {
                     }
                 }
 
-                // Trending Now / Content Section
-                item {
-                    SectionHeader(
-                        title = if (searchQuery.isNotBlank()) "Search Results" else "Trending Now"
-                    )
-                }
-
-                if (mediaItems.isEmpty()) {
+                // Show Search Results if query is non-blank
+                if (searchQuery.isNotBlank()) {
                     item {
-                        EmptyStatePlaceholder(
-                            message = if (searchQuery.isNotBlank()) "No search results found for \"$searchQuery\"" else "No content available. Upload one now!"
-                        )
+                        SectionHeader(title = "Search Results")
                     }
-                } else {
-                    // Show Grid or Row based on Search vs General list
-                    if (searchQuery.isNotBlank()) {
+
+                    if (mediaItems.isEmpty()) {
+                        item {
+                            EmptyStatePlaceholder(
+                                message = "No search results found for \"$searchQuery\""
+                            )
+                        }
+                    } else {
                         item {
                             LazyVerticalGrid(
                                 columns = GridCells.Fixed(3),
@@ -246,8 +255,15 @@ fun HomeScreen(viewModel: MediaViewModel) {
                                 }
                             }
                         }
-                    } else {
-                        // General Row
+                    }
+                } else {
+                    // Display Premium Recommendations & Category List
+
+                    // 1. Continue Watching
+                    if (continueWatching.isNotEmpty()) {
+                        item {
+                            SectionHeader(title = "Continue Watching")
+                        }
                         item {
                             LazyRow(
                                 modifier = Modifier
@@ -255,7 +271,7 @@ fun HomeScreen(viewModel: MediaViewModel) {
                                     .padding(start = 12.dp, bottom = 16.dp),
                                 horizontalArrangement = Arrangement.spacedBy(10.dp)
                             ) {
-                                items(mediaItems) { item ->
+                                items(continueWatching) { item ->
                                     MediaCard(
                                         item = item,
                                         onClick = { viewModel.selectMedia(item.id) }
@@ -263,30 +279,121 @@ fun HomeScreen(viewModel: MediaViewModel) {
                                 }
                             }
                         }
-                        
-                        // Add some unique manual sections
+                    }
+
+                    // 2. Trending Now Section
+                    item {
+                        SectionHeader(title = "Trending Now")
+                    }
+                    item {
+                        val activeTrending = if (trendingItems.isNotEmpty()) trendingItems else mediaItems
+                        if (activeTrending.isNotEmpty()) {
+                            LazyRow(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(start = 12.dp, bottom = 16.dp),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                items(activeTrending) { item ->
+                                    MediaCard(
+                                        item = item,
+                                        onClick = { viewModel.selectMedia(item.id) }
+                                    )
+                                }
+                            }
+                        } else {
+                            EmptyStatePlaceholder(message = "No content available. Upload one now!")
+                        }
+                    }
+
+                    // 3. Recommended For You
+                    if (recommendedItems.isNotEmpty()) {
                         item {
-                            SectionHeader(title = "Editor's Choice Special")
+                            SectionHeader(title = "Recommended For You")
                         }
                         item {
-                            val editorsChoice = mediaItems.filter { it.rating >= 8.5 }
-                            if (editorsChoice.isNotEmpty()) {
-                                LazyRow(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(start = 12.dp, bottom = 16.dp),
-                                    horizontalArrangement = Arrangement.spacedBy(10.dp)
-                                ) {
-                                    items(editorsChoice) { item ->
-                                        MediaCard(
-                                            item = item,
-                                            onClick = { viewModel.selectMedia(item.id) }
-                                        )
-                                    }
+                            LazyRow(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(start = 12.dp, bottom = 16.dp),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                items(recommendedItems) { item ->
+                                    MediaCard(
+                                        item = item,
+                                        onClick = { viewModel.selectMedia(item.id) }
+                                    )
                                 }
-                            } else {
-                                EmptyStatePlaceholder(message = "No high-rated items available yet.")
                             }
+                        }
+                    }
+
+                    // 4. Latest Uploads
+                    if (latestUploads.isNotEmpty()) {
+                        item {
+                            SectionHeader(title = "Latest Uploads")
+                        }
+                        item {
+                            LazyRow(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(start = 12.dp, bottom = 16.dp),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                items(latestUploads) { item ->
+                                    MediaCard(
+                                        item = item,
+                                        onClick = { viewModel.selectMedia(item.id) }
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    // 5. Popular This Week
+                    if (popularThisWeek.isNotEmpty()) {
+                        item {
+                            SectionHeader(title = "Popular This Week")
+                        }
+                        item {
+                            LazyRow(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(start = 12.dp, bottom = 16.dp),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                items(popularThisWeek) { item ->
+                                    MediaCard(
+                                        item = item,
+                                        onClick = { viewModel.selectMedia(item.id) }
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    // 6. Editor's Choice Specials
+                    item {
+                        SectionHeader(title = "Editor's Choice Special")
+                    }
+                    item {
+                        val editorsChoice = mediaItems.filter { it.rating >= 8.5 }
+                        if (editorsChoice.isNotEmpty()) {
+                            LazyRow(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(start = 12.dp, bottom = 16.dp),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                items(editorsChoice) { item ->
+                                    MediaCard(
+                                        item = item,
+                                        onClick = { viewModel.selectMedia(item.id) }
+                                    )
+                                }
+                            }
+                        } else {
+                            EmptyStatePlaceholder(message = "No high-rated items available yet.")
                         }
                     }
                 }
@@ -2001,6 +2108,9 @@ fun UploadDialog(
     var badge by remember { mutableStateOf("") }
     var isSlide by remember { mutableStateOf(false) }
     var platform by remember { mutableStateOf("None") }
+    var genreInput by remember { mutableStateOf("Action") }
+    val loggedInUser = viewModel.currentUser
+    var uploaderNameInput by remember { mutableStateOf(loggedInUser?.displayName ?: loggedInUser?.email?.substringBefore("@") ?: "Legendary Streamer") }
 
     var selectedVideoUri by remember { mutableStateOf<android.net.Uri?>(null) }
     var selectedCoverUri by remember { mutableStateOf<android.net.Uri?>(null) }
@@ -2324,6 +2434,42 @@ fun UploadDialog(
                         modifier = Modifier.fillMaxWidth().testTag("upload_hashtags_field")
                     )
 
+                    // Genre and Uploader Name Row
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        OutlinedTextField(
+                            value = genreInput,
+                            onValueChange = { genreInput = it },
+                            label = { Text("Genre * (e.g. Action, Comedy)") },
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = MovieRed,
+                                unfocusedBorderColor = DeepGrey,
+                                focusedTextColor = SoftWhite,
+                                unfocusedTextColor = SoftWhite,
+                                focusedLabelColor = MovieRed
+                            ),
+                            singleLine = true,
+                            modifier = Modifier.weight(1f).testTag("upload_genre_field")
+                        )
+
+                        OutlinedTextField(
+                            value = uploaderNameInput,
+                            onValueChange = { uploaderNameInput = it },
+                            label = { Text("Uploader Name") },
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = MovieRed,
+                                unfocusedBorderColor = DeepGrey,
+                                focusedTextColor = SoftWhite,
+                                unfocusedTextColor = SoftWhite,
+                                focusedLabelColor = MovieRed
+                            ),
+                            singleLine = true,
+                            modifier = Modifier.weight(1f).testTag("upload_uploader_field")
+                        )
+                    }
+
                     // Rating & Badge Row
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -2409,6 +2555,8 @@ fun UploadDialog(
                                     streamingPlatform = platform,
                                     videoUri = selectedVideoUri,
                                     coverUri = selectedCoverUri,
+                                    genre = genreInput,
+                                    uploaderName = uploaderNameInput,
                                     onSuccess = {
                                         Toast.makeText(context, "🚀 Video uploaded successfully into wholeTV database!", Toast.LENGTH_LONG).show()
                                         onDismiss()
@@ -2603,4 +2751,216 @@ fun getFileName(context: android.content.Context, uri: android.net.Uri): String 
         }
     }
     return result ?: "Unknown file"
+}
+
+// ==========================================
+// PREMIUM SEARCH SCREEN COMPONENT
+// ==========================================
+@Composable
+fun SearchScreen(viewModel: MediaViewModel) {
+    val queryText by viewModel.searchQueryText.collectAsStateWithLifecycle()
+    val isSearchLoading by viewModel.isSearchLoading.collectAsStateWithLifecycle()
+    val searchResults by viewModel.searchResults.collectAsStateWithLifecycle()
+    val context = LocalContext.current
+
+    val suggestions = listOf("Action", "Comedy", "Anime", "Sci-Fi", "Netflix", "Recommend", "Disney+", "4K Ultra HD")
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(PremiumDarkBg)
+            .padding(top = 40.dp, start = 16.dp, end = 16.dp)
+    ) {
+        Text(
+            text = "Discover Content",
+            color = SoftWhite,
+            fontSize = 24.sp,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.padding(bottom = 12.dp)
+        )
+
+        // Large Premium Modern Search Bar
+        OutlinedTextField(
+            value = queryText,
+            onValueChange = { viewModel.setSearchQueryText(it) },
+            placeholder = {
+                Text(
+                    text = "Search by title, genre, hashtags, language...",
+                    color = MutedSlate,
+                    fontSize = 14.sp
+                )
+            },
+            leadingIcon = {
+                Icon(
+                    imageVector = Icons.Filled.Search,
+                    contentDescription = "Search",
+                    tint = MovieRed,
+                    modifier = Modifier.size(20.dp)
+                )
+            },
+            trailingIcon = {
+                if (queryText.isNotEmpty()) {
+                    IconButton(onClick = { viewModel.setSearchQueryText("") }) {
+                        Icon(
+                            imageVector = Icons.Filled.Close,
+                            contentDescription = "Clear",
+                            tint = SoftWhite,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+                }
+            },
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor = MovieRed,
+                unfocusedBorderColor = DeepGrey,
+                focusedTextColor = SoftWhite,
+                unfocusedTextColor = SoftWhite,
+                focusedContainerColor = DarkSurface,
+                unfocusedContainerColor = DarkSurface
+            ),
+            shape = RoundedCornerShape(16.dp),
+            singleLine = true,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(56.dp)
+                .testTag("premium_search_input")
+        )
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        if (isSearchLoading) {
+            // Loading state
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f),
+                contentAlignment = Alignment.Center
+            ) {
+                CircularProgressIndicator(color = MovieRed)
+            }
+        } else if (queryText.isBlank()) {
+            // Empty State: Show recommendations, popular tags, and suggestions
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+            ) {
+                Text(
+                    text = "Popular Searches",
+                    color = SoftWhite,
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(vertical = 8.dp)
+                )
+
+                // Suggestions Scroll Row
+                androidx.compose.foundation.lazy.LazyRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
+                ) {
+                    items(suggestions) { tag ->
+                        Card(
+                            colors = CardDefaults.cardColors(containerColor = DarkSurface),
+                            border = BorderStroke(1.dp, MovieRed.copy(alpha = 0.4f)),
+                            shape = RoundedCornerShape(20.dp),
+                            onClick = { viewModel.setSearchQueryText(tag) },
+                            modifier = Modifier.testTag("search_suggest_$tag")
+                        ) {
+                            Text(
+                                text = tag,
+                                color = SoftWhite,
+                                fontSize = 13.sp,
+                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
+                            )
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(24.dp))
+
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Icon(
+                            imageVector = Icons.Filled.Movie,
+                            contentDescription = null,
+                            tint = MovieRed.copy(alpha = 0.6f),
+                            modifier = Modifier.size(64.dp)
+                        )
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Text(
+                            text = "Instant real-time search across wholeTV database",
+                            color = MutedSlate,
+                            fontSize = 14.sp,
+                            textAlign = TextAlign.Center
+                        )
+                    }
+                }
+            }
+        } else if (searchResults.isEmpty()) {
+            // No Results State
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Icon(
+                        imageVector = Icons.Filled.SearchOff,
+                        contentDescription = null,
+                        tint = MutedSlate,
+                        modifier = Modifier.size(64.dp)
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Text(
+                        text = "No results found for \"$queryText\"",
+                        color = SoftWhite,
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "Try searching for categories, hashtags, genres, or languages.",
+                        color = MutedSlate,
+                        fontSize = 13.sp,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.padding(horizontal = 32.dp)
+                    )
+                }
+            }
+        } else {
+            // Results State: Beautiful Grid
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+            ) {
+                Text(
+                    text = "${searchResults.size} matches found",
+                    color = MutedSlate,
+                    fontSize = 13.sp,
+                    modifier = Modifier.padding(bottom = 8.dp)
+                )
+
+                androidx.compose.foundation.lazy.grid.LazyVerticalGrid(
+                    columns = androidx.compose.foundation.lazy.grid.GridCells.Fixed(3),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                    modifier = Modifier.fillMaxSize()
+                ) {
+                    items(searchResults) { item ->
+                        MediaCard(
+                            item = item,
+                            onClick = { viewModel.selectMedia(item.id) }
+                        )
+                    }
+                }
+            }
+        }
+    }
 }

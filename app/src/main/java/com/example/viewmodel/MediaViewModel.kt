@@ -76,7 +76,7 @@ class MediaViewModel(private val context: android.content.Context, private val r
             items = items.filter { it.category.equals(category, ignoreCase = true) }
         }
         
-        // Filter by search query if non-empty (smart keywords matching across title, description, hashtags, and category)
+        // Filter by search query if non-empty (smart keywords matching across title, description, hashtags, category, genre, languages, and uploaderName)
         if (query.isNotBlank()) {
             val keywords = query.trim().split("\\s+".toRegex()).filter { it.isNotBlank() }
             if (keywords.isNotEmpty()) {
@@ -85,13 +85,78 @@ class MediaViewModel(private val context: android.content.Context, private val r
                         item.title.contains(keyword, ignoreCase = true) ||
                         item.description.contains(keyword, ignoreCase = true) ||
                         item.hashtags.contains(keyword, ignoreCase = true) ||
-                        item.category.contains(keyword, ignoreCase = true)
+                        item.category.contains(keyword, ignoreCase = true) ||
+                        item.genre.contains(keyword, ignoreCase = true) ||
+                        item.languages.contains(keyword, ignoreCase = true) ||
+                        item.uploaderName.contains(keyword, ignoreCase = true)
                     }
                 }
             }
         }
         items
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    // Dynamic Search Page Flows
+    private val _searchQueryText = MutableStateFlow("")
+    val searchQueryText: StateFlow<String> = _searchQueryText.asStateFlow()
+
+    private val _isSearchLoading = MutableStateFlow(false)
+    val isSearchLoading: StateFlow<Boolean> = _isSearchLoading.asStateFlow()
+
+    fun setSearchQueryText(query: String) {
+        _searchQueryText.value = query
+        if (query.isNotBlank()) {
+            viewModelScope.launch {
+                _isSearchLoading.value = true
+                delay(300) // smooth typing loading effect
+                _isSearchLoading.value = false
+            }
+        }
+    }
+
+    val searchResults: StateFlow<List<MediaItem>> = combine(
+        _searchQueryText,
+        repository.allMediaItems
+    ) { query, allItems ->
+        if (query.isBlank()) {
+            return@combine emptyList()
+        }
+        val keywords = query.trim().split("\\s+".toRegex()).filter { it.isNotBlank() }
+        if (keywords.isEmpty()) return@combine emptyList()
+
+        allItems.filter { item ->
+            keywords.any { keyword ->
+                item.title.contains(keyword, ignoreCase = true) ||
+                item.description.contains(keyword, ignoreCase = true) ||
+                item.hashtags.contains(keyword, ignoreCase = true) ||
+                item.category.contains(keyword, ignoreCase = true) ||
+                item.genre.contains(keyword, ignoreCase = true) ||
+                item.languages.contains(keyword, ignoreCase = true) ||
+                item.uploaderName.contains(keyword, ignoreCase = true)
+            }
+        }
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    // Recommendation Sections
+    val trendingItems: StateFlow<List<MediaItem>> = repository.allMediaItems
+        .map { items -> items.sortedByDescending { it.views }.take(10) }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val latestUploads: StateFlow<List<MediaItem>> = repository.allMediaItems
+        .map { items -> items.sortedByDescending { it.timestamp }.take(10) }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val recommendedItems: StateFlow<List<MediaItem>> = repository.allMediaItems
+        .map { items -> items.sortedByDescending { it.rating }.take(10) }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val popularThisWeek: StateFlow<List<MediaItem>> = repository.allMediaItems
+        .map { items -> items.sortedByDescending { it.likes }.take(10) }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val continueWatching: StateFlow<List<MediaItem>> = repository.allMediaItems
+        .map { items -> items.filter { it.watchTime > 0 || it.views > 200 }.sortedByDescending { it.timestamp }.take(10) }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     // Slides banner flow (isSlide = 1)
     @OptIn(ExperimentalCoroutinesApi::class)
@@ -131,10 +196,89 @@ class MediaViewModel(private val context: android.content.Context, private val r
 
     // Persistent User Identity using SharedPreferences
     private val sharedPrefs = context.getSharedPreferences("wholetv_prefs", android.content.Context.MODE_PRIVATE)
-    val currentUserId: String = sharedPrefs.getString("user_id", null) ?: run {
-        val newId = java.util.UUID.randomUUID().toString()
-        sharedPrefs.edit().putString("user_id", newId).apply()
-        newId
+    val currentUserId: String
+        get() = auth?.currentUser?.uid ?: (sharedPrefs.getString("user_id", null) ?: run {
+            val newId = java.util.UUID.randomUUID().toString()
+            sharedPrefs.edit().putString("user_id", newId).apply()
+            newId
+        })
+
+    // Firebase Authentication
+    val auth: com.google.firebase.auth.FirebaseAuth? by lazy {
+        try {
+            com.google.firebase.auth.FirebaseAuth.getInstance()
+        } catch (t: Throwable) {
+            android.util.Log.e("FirebaseInit", "FirebaseAuth could not be initialized", t)
+            null
+        }
+    }
+
+    val currentUser: com.google.firebase.auth.FirebaseUser?
+        get() = auth?.currentUser
+
+    private val _isUserLoggedIn = MutableStateFlow(auth?.currentUser != null)
+    val isUserLoggedIn: StateFlow<Boolean> = _isUserLoggedIn.asStateFlow()
+
+    fun checkUserLoggedIn() {
+        _isUserLoggedIn.value = auth?.currentUser != null
+    }
+
+    fun loginUser(email: String, password: String, onSuccess: () -> Unit, onFailure: (String) -> Unit) {
+        val a = auth ?: run {
+            onFailure("Firebase Authentication is not available.")
+            return
+        }
+        viewModelScope.launch {
+            try {
+                a.signInWithEmailAndPassword(email, password).await()
+                _isUserLoggedIn.value = true
+                onSuccess()
+            } catch (e: Exception) {
+                onFailure(e.localizedMessage ?: "Failed to sign in.")
+            }
+        }
+    }
+
+    fun signUpUser(email: String, password: String, onSuccess: () -> Unit, onFailure: (String) -> Unit) {
+        val a = auth ?: run {
+            onFailure("Firebase Authentication is not available.")
+            return
+        }
+        viewModelScope.launch {
+            try {
+                a.createUserWithEmailAndPassword(email, password).await()
+                _isUserLoggedIn.value = true
+                onSuccess()
+            } catch (e: Exception) {
+                onFailure(e.localizedMessage ?: "Failed to sign up.")
+            }
+        }
+    }
+
+    fun logoutUser() {
+        auth?.signOut()
+        _isUserLoggedIn.value = false
+    }
+
+    // Dynamic Watch Time Tracking
+    fun addWatchTime(id: Int, seconds: Long) {
+        viewModelScope.launch {
+            val media = repository.getMediaItemById(id).firstOrNull()
+            if (media != null) {
+                val updated = media.copy(watchTime = media.watchTime + seconds)
+                repository.insertMediaItem(updated)
+
+                val db = firestore
+                if (media.firestoreId.isNotEmpty() && db != null) {
+                    try {
+                        db.collection("media_items").document(media.firestoreId)
+                            .update("watchTime", com.google.firebase.firestore.FieldValue.increment(seconds))
+                    } catch (e: Exception) {
+                        android.util.Log.e("WatchTime", "Failed to increment watchTime in Firestore", e)
+                    }
+                }
+            }
+        }
     }
 
     // Firebase references initialized safely with lazy try-catch to prevent crashes on startup if missing configuration
@@ -214,6 +358,9 @@ class MediaViewModel(private val context: android.content.Context, private val r
                                 val downloads = doc.getLong("downloads")?.toInt() ?: 0
                                 val streamingPlatform = doc.getString("streamingPlatform") ?: "None"
                                 val timestamp = doc.getLong("timestamp") ?: System.currentTimeMillis()
+                                val genre = doc.getString("genre") ?: "Action"
+                                val uploaderName = doc.getString("uploaderName") ?: "Anonymous"
+                                val watchTime = doc.getLong("watchTime") ?: 0L
 
                                 val existing = repository.getMediaItemByFirestoreId(docId)
                                 if (existing != null) {
@@ -235,7 +382,10 @@ class MediaViewModel(private val context: android.content.Context, private val r
                                         shares = shares,
                                         downloads = downloads,
                                         streamingPlatform = streamingPlatform,
-                                        timestamp = timestamp
+                                        timestamp = timestamp,
+                                        genre = genre,
+                                        uploaderName = uploaderName,
+                                        watchTime = watchTime
                                     )
                                     repository.insertMediaItem(updated)
                                 } else {
@@ -258,7 +408,10 @@ class MediaViewModel(private val context: android.content.Context, private val r
                                         downloads = downloads,
                                         streamingPlatform = streamingPlatform,
                                         firestoreId = docId,
-                                        timestamp = timestamp
+                                        timestamp = timestamp,
+                                        genre = genre,
+                                        uploaderName = uploaderName,
+                                        watchTime = watchTime
                                     )
                                     repository.insertMediaItem(newItem)
                                 }
@@ -290,12 +443,73 @@ class MediaViewModel(private val context: android.content.Context, private val r
         _searchQuery.value = query
     }
 
+    private var commentsListenerReg: com.google.firebase.firestore.ListenerRegistration? = null
+
+    private fun listenForComments(mediaItemId: Int, firestoreId: String) {
+        commentsListenerReg?.remove()
+        val db = firestore ?: return
+        if (firestoreId.isBlank()) return
+
+        commentsListenerReg = db.collection("media_items")
+            .document(firestoreId)
+            .collection("comments")
+            .addSnapshotListener { snapshot, error ->
+                if (error != null) {
+                    android.util.Log.e("CommentsSync", "Listen for comments failed.", error)
+                    return@addSnapshotListener
+                }
+
+                if (snapshot != null) {
+                    viewModelScope.launch {
+                        for (doc in snapshot.documents) {
+                            try {
+                                val userName = doc.getString("userName") ?: "Anonymous"
+                                val text = doc.getString("text") ?: ""
+                                val timestamp = doc.getLong("timestamp") ?: System.currentTimeMillis()
+
+                                // Check if comment already exists locally
+                                val existingComments = repository.getCommentsForMedia(mediaItemId).firstOrNull() ?: emptyList()
+                                val exists = existingComments.any { it.userName.trim() == userName.trim() && it.text.trim() == text.trim() }
+                                if (!exists) {
+                                    val newComment = Comment(
+                                        mediaItemId = mediaItemId,
+                                        userName = userName,
+                                        text = text,
+                                        timestamp = timestamp
+                                    )
+                                    repository.insertComment(newComment)
+                                }
+                            } catch (e: Exception) {
+                                android.util.Log.e("CommentsSync", "Error parsing comment doc", e)
+                            }
+                        }
+                    }
+                }
+            }
+    }
+
     fun selectMedia(id: Int?) {
         _selectedMediaId.value = id
         if (id != null) {
             viewModelScope.launch {
                 repository.incrementViews(id)
+                val media = repository.getMediaItemById(id).firstOrNull()
+                if (media != null) {
+                    val db = firestore
+                    if (media.firestoreId.isNotEmpty() && db != null) {
+                        try {
+                            db.collection("media_items").document(media.firestoreId)
+                                .update("views", com.google.firebase.firestore.FieldValue.increment(1))
+                        } catch (e: Exception) {
+                            android.util.Log.e("selectMedia", "Failed to increment views in Firestore", e)
+                        }
+                        listenForComments(id, media.firestoreId)
+                    }
+                }
             }
+        } else {
+            commentsListenerReg?.remove()
+            commentsListenerReg = null
         }
     }
 
@@ -306,13 +520,35 @@ class MediaViewModel(private val context: android.content.Context, private val r
     fun likeMedia(id: Int) {
         viewModelScope.launch {
             repository.incrementLikes(id)
+            val media = repository.getMediaItemById(id).firstOrNull()
+            if (media != null) {
+                val db = firestore
+                if (media.firestoreId.isNotEmpty() && db != null) {
+                    try {
+                        db.collection("media_items").document(media.firestoreId)
+                            .update("likes", com.google.firebase.firestore.FieldValue.increment(1))
+                    } catch (e: Exception) {
+                        android.util.Log.e("likeMedia", "Failed to increment likes in Firestore", e)
+                    }
+                }
+            }
         }
     }
 
     fun shareMedia(id: Int, onShareText: (String) -> Unit) {
         viewModelScope.launch {
             repository.incrementShares(id)
-            repository.getMediaItemById(id).firstOrNull()?.let { media ->
+            val media = repository.getMediaItemById(id).firstOrNull()
+            if (media != null) {
+                val db = firestore
+                if (media.firestoreId.isNotEmpty() && db != null) {
+                    try {
+                        db.collection("media_items").document(media.firestoreId)
+                            .update("shares", com.google.firebase.firestore.FieldValue.increment(1))
+                    } catch (e: Exception) {
+                        android.util.Log.e("shareMedia", "Failed to increment shares in Firestore", e)
+                    }
+                }
                 val shareText = "🎥 Check out this amazing show on wholeTV!\n\n" +
                         "Title: ${media.title}\n" +
                         "Description: ${media.description}\n" +
@@ -335,6 +571,26 @@ class MediaViewModel(private val context: android.content.Context, private val r
                 text = text.trim()
             )
             repository.insertComment(comment)
+
+            val media = repository.getMediaItemById(mediaItemId).firstOrNull()
+            if (media != null) {
+                val db = firestore
+                if (media.firestoreId.isNotEmpty() && db != null) {
+                    try {
+                        val commentData = hashMapOf(
+                            "userName" to userName.trim(),
+                            "text" to text.trim(),
+                            "timestamp" to System.currentTimeMillis()
+                        )
+                        db.collection("media_items")
+                            .document(media.firestoreId)
+                            .collection("comments")
+                            .add(commentData)
+                    } catch (e: Exception) {
+                        android.util.Log.e("submitComment", "Failed to add comment to Firestore", e)
+                    }
+                }
+            }
         }
     }
 
@@ -374,6 +630,8 @@ class MediaViewModel(private val context: android.content.Context, private val r
         streamingPlatform: String,
         videoUri: android.net.Uri?,
         coverUri: android.net.Uri?,
+        genre: String = "Action",
+        uploaderName: String = "Anonymous",
         onSuccess: () -> Unit,
         onFailure: (String) -> Unit
     ) {
@@ -419,7 +677,10 @@ class MediaViewModel(private val context: android.content.Context, private val r
                         likes = 0,
                         shares = 0,
                         downloads = 0,
-                        timestamp = System.currentTimeMillis()
+                        timestamp = System.currentTimeMillis(),
+                        genre = genre.trim(),
+                        uploaderName = uploaderName.trim(),
+                        watchTime = 0L
                     )
 
                     repository.insertMediaItem(newItem)
@@ -485,7 +746,10 @@ class MediaViewModel(private val context: android.content.Context, private val r
                     "likes" to 0,
                     "shares" to 0,
                     "downloads" to 0,
-                    "timestamp" to System.currentTimeMillis()
+                    "timestamp" to System.currentTimeMillis(),
+                    "genre" to genre.trim(),
+                    "uploaderName" to uploaderName.trim(),
+                    "watchTime" to 0L
                 )
 
                 db.collection("media_items").document(uploadId).set(meta).await()
