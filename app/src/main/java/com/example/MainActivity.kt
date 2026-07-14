@@ -3115,6 +3115,33 @@ fun formatCount(count: Int): String {
     }
 }
 
+// Utility to hide/show system status bar and navigation bar in immersive fullscreen mode
+fun toggleSystemUI(activity: android.app.Activity, hide: Boolean) {
+    val window = activity.window
+    if (hide) {
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            window.insetsController?.let { controller ->
+                controller.hide(android.view.WindowInsets.Type.statusBars() or android.view.WindowInsets.Type.navigationBars())
+                controller.systemBarsBehavior = android.view.WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            window.decorView.systemUiVisibility = (
+                android.view.View.SYSTEM_UI_FLAG_FULLSCREEN
+                or android.view.View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                or android.view.View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+            )
+        }
+    } else {
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            window.insetsController?.show(android.view.WindowInsets.Type.statusBars() or android.view.WindowInsets.Type.navigationBars())
+        } else {
+            @Suppress("DEPRECATION")
+            window.decorView.systemUiVisibility = android.view.View.SYSTEM_UI_FLAG_VISIBLE
+        }
+    }
+}
+
 @Composable
 fun VideoPlayer(
     videoUrl: String,
@@ -3135,6 +3162,7 @@ fun VideoPlayer(
     // Custom States
     var isPlayingState by remember { mutableStateOf(true) }
     var isFullscreen by remember { mutableStateOf(false) }
+    var isOrientationLocked by remember { mutableStateOf(false) }
     var currentSpeed by remember { mutableStateOf(1.0f) }
     var resizeMode by remember { mutableStateOf(androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT) }
     var isControlsVisible by remember { mutableStateOf(true) }
@@ -3178,7 +3206,7 @@ fun VideoPlayer(
         }
     }
 
-    // Save playback position periodically and on dispose
+    // Save playback position periodically and on dispose, clean up status/navigation bar and screen orientation
     DisposableEffect(exoPlayer) {
         onDispose {
             exoPlayer?.let {
@@ -3186,8 +3214,30 @@ fun VideoPlayer(
                 prefs.edit().putLong(safeVideoUrl, it.currentPosition).apply()
                 it.release()
             }
-            // Reset orientation to portrait on exit
-            activity?.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            activity?.let { act ->
+                toggleSystemUI(act, false)
+                act.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            }
+        }
+    }
+
+    // Automatic screen rotation and immersive mode state machine
+    LaunchedEffect(isFullscreen, isOrientationLocked) {
+        activity?.let { act ->
+            toggleSystemUI(act, isFullscreen)
+            if (isOrientationLocked) {
+                act.requestedOrientation = if (isFullscreen) {
+                    android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+                } else {
+                    android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                }
+            } else {
+                act.requestedOrientation = if (isFullscreen) {
+                    android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                } else {
+                    android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                }
+            }
         }
     }
 
@@ -3440,11 +3490,6 @@ fun VideoPlayer(
                                 onClick = {
                                     // Fullscreen toggle
                                     isFullscreen = !isFullscreen
-                                    activity?.requestedOrientation = if (isFullscreen) {
-                                        android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
-                                    } else {
-                                        android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-                                    }
                                 },
                                 modifier = Modifier.background(Color.Black.copy(alpha = 0.4f), CircleShape)
                             ) {
@@ -3549,6 +3594,22 @@ fun VideoPlayer(
                                         )
                                     }
                                 }
+                            }
+                            Spacer(modifier = Modifier.width(6.dp))
+
+                            // Orientation lock button
+                            IconButton(
+                                onClick = {
+                                    isOrientationLocked = !isOrientationLocked
+                                    Toast.makeText(context, if (isOrientationLocked) "Rotation Locked" else "Auto-Rotate Enabled", Toast.LENGTH_SHORT).show()
+                                },
+                                modifier = Modifier.background(Color.Black.copy(alpha = 0.4f), CircleShape)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.ScreenRotation,
+                                    contentDescription = "Screen Orientation Lock",
+                                    tint = if (isOrientationLocked) MovieRed else Color.White
+                                )
                             }
                             Spacer(modifier = Modifier.width(6.dp))
 

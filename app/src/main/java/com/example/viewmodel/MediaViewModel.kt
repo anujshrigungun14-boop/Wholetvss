@@ -410,6 +410,12 @@ class MediaViewModel(private val context: android.content.Context, private val r
             } catch (e: Exception) {
                 android.util.Log.e("MediaViewModel", "Failed to clear old demo items", e)
             }
+            // Resume pending chunked uploads
+            try {
+                resumePendingUploads()
+            } catch (e: Exception) {
+                android.util.Log.e("MediaViewModel", "Failed to auto-resume pending uploads", e)
+            }
         }
     }
 
@@ -620,7 +626,7 @@ class MediaViewModel(private val context: android.content.Context, private val r
         }
     }
 
-    // Custom "Ultra Legendary Fast Upload System" using Cloudinary
+    // Custom "Ultra Legendary Fast Upload System" using Cloudinary with Chunked Upload for production scale
     fun uploadMedia(
         title: String,
         description: String,
@@ -646,7 +652,7 @@ class MediaViewModel(private val context: android.content.Context, private val r
         }
         android.util.Log.i("UploadMedia", "[STEP 1: File Selection & URI Validation] Starting upload process...")
         if (videoUri == null) {
-            onFailure("selected video URI is null.")
+            onFailure("Selected video URI is null.")
             return
         }
 
@@ -655,124 +661,352 @@ class MediaViewModel(private val context: android.content.Context, private val r
             _uploadProgressValue.value = 0f
 
             try {
-                withContext(Dispatchers.IO) {
-                    val context = context
-                    val mimeType = try {
-                        context.contentResolver.getType(videoUri) ?: ""
-                    } catch (e: Exception) {
-                        ""
+                val context = context
+                val mimeType = try {
+                    context.contentResolver.getType(videoUri) ?: ""
+                } catch (e: Exception) {
+                    ""
+                }
+                val isVideoMime = mimeType.startsWith("video/") || 
+                        videoUri.toString().endsWith(".mp4", ignoreCase = true) || 
+                        videoUri.toString().endsWith(".mkv", ignoreCase = true) || 
+                        videoUri.toString().endsWith(".webm", ignoreCase = true)
+                
+                if (!isVideoMime) {
+                    _isUploading.value = false
+                    onFailure("MIME type validation failed: Selected file is not a video.")
+                    return@launch
+                }
+
+                // Copy input stream to file on Dispatchers.IO
+                val videoFile = withContext(Dispatchers.IO) {
+                    getFileFromUri(context, videoUri)
+                }
+                if (videoFile == null || !videoFile.exists() || !videoFile.canRead()) {
+                    _isUploading.value = false
+                    onFailure("Failed to access or read the selected video file.")
+                    return@launch
+                }
+
+                val coverFile = if (coverUri != null) {
+                    withContext(Dispatchers.IO) {
+                        getFileFromUri(context, coverUri)
                     }
-                    val isVideoMime = mimeType.startsWith("video/") || 
-                            videoUri.toString().endsWith(".mp4", ignoreCase = true) || 
-                            videoUri.toString().endsWith(".mkv", ignoreCase = true) || 
-                            videoUri.toString().endsWith(".webm", ignoreCase = true)
-                    
-                    if (!isVideoMime) {
-                        withContext(Dispatchers.Main) {
-                            _isUploading.value = false
-                            onFailure("MIME type validation failed: Selected file is not a video.")
+                } else null
+
+                val uploadId = "wholetv_" + java.util.UUID.randomUUID().toString().replace("-", "")
+                
+                // Save pending upload metadata to SharedPreferences persistently
+                val json = org.json.JSONObject().apply {
+                    put("uploadId", uploadId)
+                    put("filePath", videoFile.absolutePath)
+                    put("coverFilePath", coverFile?.absolutePath ?: "")
+                    put("startByte", 0L)
+                    put("title", title)
+                    put("description", description)
+                    put("category", category)
+                    put("hashtags", hashtags)
+                    put("qualities", qualities)
+                    put("languages", languages)
+                    put("rating", rating)
+                    put("isSlide", isSlide)
+                    put("badge", badge)
+                    put("streamingPlatform", streamingPlatform)
+                    put("genre", genre)
+                    put("uploaderName", uploaderName)
+                    put("currentUserId", currentUserId)
+                }
+                
+                val prefs = context.getSharedPreferences("wholetv_pending_uploads", android.content.Context.MODE_PRIVATE)
+                prefs.edit().putString(uploadId, json.toString()).apply()
+
+                // Execute the actual pipeline
+                executeUploadPipelineWithJson(uploadId, json, onSuccess, onFailure)
+            } catch (e: Exception) {
+                _isUploading.value = false
+                onFailure(e.localizedMessage ?: "Failed to initialize upload.")
+            }
+        }
+    }
+
+    private suspend fun executeUploadPipelineWithJson(
+        uploadId: String,
+        json: org.json.JSONObject,
+        onSuccess: (() -> Unit)? = null,
+        onFailure: ((String) -> Unit)? = null
+    ) {
+        _isUploading.value = true
+        _uploadProgressValue.value = 0f
+
+        val filePath = json.getString("filePath")
+        val coverFilePath = json.optString("coverFilePath", "")
+        val title = json.getString("title")
+        val description = json.getString("description")
+        val category = json.getString("category")
+        val hashtags = json.getString("hashtags")
+        val qualities = json.getString("qualities")
+        val languages = json.getString("languages")
+        val rating = json.getDouble("rating")
+        val isSlide = json.getBoolean("isSlide")
+        val badge = json.getString("badge")
+        val streamingPlatform = json.getString("streamingPlatform")
+        val genre = json.getString("genre")
+        val uploaderName = json.getString("uploaderName")
+        val currentUserId = json.getString("currentUserId")
+        var startByte = json.optLong("startByte", 0L)
+
+        val videoFile = File(filePath)
+        val coverFile = if (coverFilePath.isNotEmpty()) File(coverFilePath) else null
+
+        try {
+            val okHttpClient = okhttp3.OkHttpClient.Builder()
+                .connectTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+                .readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+                .build()
+
+            // 1. Upload Video
+            android.util.Log.i("UploadMedia", "Executing upload pipeline for $title (ID: $uploadId). File: ${videoFile.absolutePath}, Start: $startByte")
+            val totalSize = videoFile.length()
+            val chunkSize = 6 * 1024 * 1024 // 6 MB chunk size
+            var lastSecureUrl = ""
+            var lastPublicId = ""
+
+            if (totalSize < 5 * 1024 * 1024) {
+                // Short file - direct single upload
+                val result = withContext(Dispatchers.IO) {
+                    performSingleDirectUpload(okHttpClient, videoFile, "video/mp4", "video")
+                }
+                lastSecureUrl = result.first
+                lastPublicId = result.second
+                _uploadProgressValue.value = 0.8f
+            } else {
+                // Large file - chunked/resumable upload
+                while (startByte < totalSize) {
+                    val endByte = minOf(startByte + chunkSize, totalSize)
+                    val currentChunkSize = (endByte - startByte).toInt()
+                    val chunkBytes = ByteArray(currentChunkSize)
+
+                    withContext(Dispatchers.IO) {
+                        java.io.RandomAccessFile(videoFile, "r").use { raf ->
+                            raf.seek(startByte)
+                            raf.readFully(chunkBytes)
                         }
-                        return@withContext
                     }
 
-                    val videoFile = getFileFromUri(context, videoUri)
-                    if (videoFile == null || !videoFile.exists() || !videoFile.canRead()) {
-                        withContext(Dispatchers.Main) {
-                            _isUploading.value = false
-                            onFailure("Failed to access or read the selected video file.")
-                        }
-                        return@withContext
-                    }
+                    // Retry chunk upload if it fails
+                    var chunkSuccess = false
+                    var attempt = 0
+                    val maxAttempts = 5
+                    var responseBody = ""
+                    var lastChunkEx: Exception? = null
 
-                    val okHttpClient = okhttp3.OkHttpClient.Builder()
-                        .connectTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
-                        .readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
-                        .writeTimeout(300, java.util.concurrent.TimeUnit.SECONDS)
-                        .build()
+                    while (attempt < maxAttempts && !chunkSuccess) {
+                        attempt++
+                        try {
+                            val url = "https://api.cloudinary.com/v1_1/wholetv/auto/upload"
+                            val octetType = "application/octet-stream".toMediaTypeOrNull()
+                            val requestBody = okhttp3.RequestBody.create(octetType, chunkBytes, 0, currentChunkSize)
 
-                    android.util.Log.i("UploadMedia", "Starting robust video upload...")
-                    val videoResult = performCloudinaryUpload(
-                        okHttpClient = okHttpClient,
-                        file = videoFile,
-                        mimeType = mimeType,
-                        resourceType = "video",
-                        onProgress = { progress ->
-                            _uploadProgressValue.value = progress * 0.8f
-                        }
-                    )
-                    val videoUrl = videoResult.first
-                    val publicId = videoResult.second
-                    videoFile.delete()
+                            val multipartBody = okhttp3.MultipartBody.Builder()
+                                .setType(okhttp3.MultipartBody.FORM)
+                                .addFormDataPart("file", videoFile.name, requestBody)
+                                .addFormDataPart("upload_preset", "wholetv_upload")
+                                .build()
 
-                    var posterUrl = ""
-                    if (coverUri != null) {
-                        val coverFile = getFileFromUri(context, coverUri)
-                        if (coverFile != null && coverFile.exists() && coverFile.canRead()) {
-                            val coverMimeType = try {
-                                context.contentResolver.getType(coverUri) ?: "image/jpeg"
-                            } catch (e: Exception) {
-                                "image/jpeg"
+                            val contentRangeHeader = "bytes $startByte-${endByte - 1}/$totalSize"
+                            val request = okhttp3.Request.Builder()
+                                .url(url)
+                                .header("Accept", "application/json")
+                                .header("X-Unique-Upload-Id", uploadId)
+                                .header("Content-Range", contentRangeHeader)
+                                .post(multipartBody)
+                                .build()
+
+                            android.util.Log.i("UploadMedia", "Uploading chunk $contentRangeHeader (Attempt $attempt)...")
+                            val response = withContext(Dispatchers.IO) { okHttpClient.newCall(request).execute() }
+                            responseBody = response.body?.string() ?: ""
+
+                            if (response.isSuccessful) {
+                                chunkSuccess = true
+                                val jsonRes = org.json.JSONObject(responseBody)
+                                lastSecureUrl = jsonRes.optString("secure_url", "")
+                                lastPublicId = jsonRes.optString("public_id", "")
+                                android.util.Log.i("UploadMedia", "Chunk uploaded successfully! Content-Range: $contentRangeHeader")
+                            } else {
+                                android.util.Log.e("UploadMedia", "Chunk upload attempt $attempt failed with status ${response.code}. Response: $responseBody")
+                                lastChunkEx = Exception("HTTP ${response.code}: $responseBody")
+                                delay(2000L * attempt)
                             }
-                            android.util.Log.i("UploadMedia", "Starting robust cover upload...")
-                            val coverResult = performCloudinaryUpload(
-                                okHttpClient = okHttpClient,
-                                file = coverFile,
-                                mimeType = coverMimeType,
-                                resourceType = "image",
-                                onProgress = { progress ->
-                                    _uploadProgressValue.value = 0.8f + (progress * 0.2f)
-                                }
-                            )
-                            posterUrl = coverResult.first
-                            coverFile.delete()
+                        } catch (e: Exception) {
+                            android.util.Log.e("UploadMedia", "IOException/Exception on chunk upload attempt $attempt", e)
+                            lastChunkEx = e
+                            delay(2000L * attempt)
                         }
                     }
 
-                    if (posterUrl.isEmpty()) {
-                        posterUrl = "https://images.unsplash.com/photo-1536440136628-849c177e76a1?w=500"
+                    if (!chunkSuccess) {
+                        throw Exception("Failed to upload chunk $startByte-${endByte - 1} after $maxAttempts attempts. Error: ${lastChunkEx?.localizedMessage}")
                     }
 
-                    _uploadProgressValue.value = 1.0f
+                    startByte = endByte
+                    updatePendingUploadProgress(uploadId, startByte)
+                    _uploadProgressValue.value = (startByte.toFloat() / totalSize) * 0.8f
+                }
+            }
 
-                    val newItem = MediaItem(
-                        title = title.trim(),
-                        description = description.trim(),
-                        category = category.trim(),
-                        hashtags = hashtags.trim(),
-                        qualities = qualities.trim(),
-                        languages = languages.trim(),
-                        rating = rating,
-                        isSlide = isSlide,
-                        badge = badge.trim(),
-                        streamingPlatform = streamingPlatform,
-                        videoUrl = videoUrl,
-                        posterUrl = posterUrl,
-                        uploaderId = currentUserId,
-                        firestoreId = publicId,
-                        views = (100..500).random(),
-                        likes = 0,
-                        shares = 0,
-                        downloads = 0,
-                        timestamp = System.currentTimeMillis(),
-                        genre = genre.trim(),
-                        uploaderName = uploaderName.trim(),
-                        watchTime = 0L
-                    )
+            // 2. Upload Cover Artwork (if exists)
+            var posterUrl = ""
+            if (coverFile != null && coverFile.exists()) {
+                android.util.Log.i("UploadMedia", "Uploading cover artwork: ${coverFile.absolutePath}")
+                val result = withContext(Dispatchers.IO) {
+                    performSingleDirectUpload(okHttpClient, coverFile, "image/jpeg", "image")
+                }
+                posterUrl = result.first
+                _uploadProgressValue.value = 0.95f
+            }
 
-                    repository.insertMediaItem(newItem)
-                    withContext(Dispatchers.Main) {
-                        _isUploading.value = false
-                        onSuccess()
+            if (posterUrl.isEmpty()) {
+                posterUrl = "https://images.unsplash.com/photo-1536440136628-849c177e76a1?w=500"
+            }
+
+            _uploadProgressValue.value = 1.0f
+
+            // 3. Create MediaItem and save to Room database
+            val newItem = MediaItem(
+                title = title.trim(),
+                description = description.trim(),
+                category = category.trim(),
+                hashtags = hashtags.trim(),
+                qualities = qualities.trim(),
+                languages = languages.trim(),
+                rating = rating,
+                isSlide = isSlide,
+                badge = badge.trim(),
+                streamingPlatform = streamingPlatform,
+                videoUrl = lastSecureUrl,
+                posterUrl = posterUrl,
+                uploaderId = currentUserId,
+                firestoreId = lastPublicId,
+                views = (100..500).random(),
+                likes = 0,
+                shares = 0,
+                downloads = 0,
+                timestamp = System.currentTimeMillis(),
+                genre = genre.trim(),
+                uploaderName = uploaderName.trim(),
+                watchTime = 0L
+            )
+
+            withContext(Dispatchers.IO) {
+                repository.insertMediaItem(newItem)
+                // Delete local temp files
+                try {
+                    videoFile.delete()
+                    coverFile?.delete()
+                } catch (e: Exception) {
+                    // Ignore file delete errors
+                }
+            }
+
+            removePendingUpload(uploadId)
+            android.util.Log.i("UploadMedia", "Upload pipeline successfully finished for $title!")
+
+            withContext(Dispatchers.Main) {
+                _isUploading.value = false
+                onSuccess?.invoke()
+            }
+        } catch (e: Exception) {
+            val sw = java.io.StringWriter()
+            e.printStackTrace(java.io.PrintWriter(sw))
+            android.util.Log.e("UploadMedia", "Pipeline failure for $title:\n$sw")
+            withContext(Dispatchers.Main) {
+                _isUploading.value = false
+                onFailure?.invoke(e.localizedMessage ?: "Failed to upload to Cloudinary.")
+            }
+        }
+    }
+
+    private suspend fun performSingleDirectUpload(
+        okHttpClient: okhttp3.OkHttpClient,
+        file: java.io.File,
+        mimeType: String,
+        resourceType: String
+    ): Pair<String, String> {
+        val cloudName = "wholetv"
+        val preset = "wholetv_upload"
+        val url = "https://api.cloudinary.com/v1_1/$cloudName/auto/upload"
+
+        val mediaType = mimeType.toMediaTypeOrNull()
+        val requestBody = okhttp3.RequestBody.create(mediaType, file)
+
+        val multipartBody = okhttp3.MultipartBody.Builder()
+            .setType(okhttp3.MultipartBody.FORM)
+            .addFormDataPart("file", file.name, requestBody)
+            .addFormDataPart("upload_preset", preset)
+            .build()
+
+        val request = okhttp3.Request.Builder()
+            .url(url)
+            .header("Accept", "application/json")
+            .post(multipartBody)
+            .build()
+
+        val response = okHttpClient.newCall(request).execute()
+        val responseBody = response.body?.string() ?: ""
+
+        if (response.isSuccessful) {
+            val json = org.json.JSONObject(responseBody)
+            return Pair(json.getString("secure_url"), json.optString("public_id", ""))
+        } else {
+            throw Exception("HTTP ${response.code}: $responseBody")
+        }
+    }
+
+    private fun updatePendingUploadProgress(uploadId: String, startByte: Long) {
+        val prefs = context.getSharedPreferences("wholetv_pending_uploads", android.content.Context.MODE_PRIVATE)
+        val existingString = prefs.getString(uploadId, null) ?: return
+        try {
+            val json = org.json.JSONObject(existingString)
+            json.put("startByte", startByte)
+            prefs.edit().putString(uploadId, json.toString()).apply()
+        } catch (e: Exception) {
+            android.util.Log.e("MediaViewModel", "Error updating progress for $uploadId", e)
+        }
+    }
+
+    private fun removePendingUpload(uploadId: String) {
+        val prefs = context.getSharedPreferences("wholetv_pending_uploads", android.content.Context.MODE_PRIVATE)
+        prefs.edit().remove(uploadId).apply()
+    }
+
+    private fun resumePendingUploads() {
+        val prefs = context.getSharedPreferences("wholetv_pending_uploads", android.content.Context.MODE_PRIVATE)
+        val allEntries = prefs.all
+        if (allEntries.isEmpty()) return
+        
+        android.util.Log.i("MediaViewModel", "Found ${allEntries.size} pending uploads to resume.")
+        for ((uploadId, jsonStr) in allEntries) {
+            if (jsonStr !is String) continue
+            try {
+                val json = org.json.JSONObject(jsonStr)
+                val filePath = json.getString("filePath")
+                val file = File(filePath)
+                if (!file.exists() || file.length() == 0L) {
+                    android.util.Log.w("MediaViewModel", "Pending upload file $filePath does not exist. Removing.")
+                    prefs.edit().remove(uploadId).apply()
+                    continue
+                }
+                
+                // Only run one active resume pipeline if nothing is currently uploading
+                if (!_isUploading.value) {
+                    android.util.Log.i("MediaViewModel", "Resuming pending upload with ID $uploadId...")
+                    viewModelScope.launch {
+                        executeUploadPipelineWithJson(uploadId, json)
                     }
+                    break // Since we only do one at a time
                 }
             } catch (e: Exception) {
-                val sw = java.io.StringWriter()
-                e.printStackTrace(java.io.PrintWriter(sw))
-                android.util.Log.e("UploadMedia", "Detailed Cloudinary upload pipeline failure:\n$sw")
-                withContext(Dispatchers.Main) {
-                    _isUploading.value = false
-                    onFailure(e.localizedMessage ?: "Failed to upload to Cloudinary.")
-                }
+                android.util.Log.e("MediaViewModel", "Error resuming pending upload $uploadId", e)
             }
         }
     }
