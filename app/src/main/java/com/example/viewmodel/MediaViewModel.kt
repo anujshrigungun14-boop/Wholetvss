@@ -646,184 +646,197 @@ class MediaViewModel(private val context: android.content.Context, private val r
             _isUploading.value = true
             _uploadProgressValue.value = 0f
 
-            val context = context
-            val mimeType = context.contentResolver.getType(videoUri) ?: ""
-            val isVideoMime = mimeType.startsWith("video/") || videoUri.toString().endsWith(".mp4") || videoUri.toString().endsWith(".mkv") || videoUri.toString().endsWith(".webm")
-            if (!isVideoMime) {
-                _isUploading.value = false
-                onFailure("MIME type validation failed: Selected file is not a video.")
-                return@launch
-            }
-
-            val videoFile = getFileFromUri(context, videoUri)
-            if (videoFile == null || !videoFile.exists() || !videoFile.canRead()) {
-                _isUploading.value = false
-                onFailure("Failed to access or read the selected video file.")
-                return@launch
-            }
-
             try {
-                // Initialize OkHttpClient
-                val okHttpClient = okhttp3.OkHttpClient.Builder()
-                    .connectTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
-                    .readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
-                    .writeTimeout(300, java.util.concurrent.TimeUnit.SECONDS)
-                    .build()
-
-                // Upload Video to Cloudinary
-                val videoProgressBody = ProgressRequestBody(videoFile, mimeType) { progress ->
-                    _uploadProgressValue.value = progress * 0.8f
-                }
-                val videoMultipartBody = okhttp3.MultipartBody.Builder()
-                    .setType(okhttp3.MultipartBody.FORM)
-                    .addFormDataPart("file", videoFile.name, videoProgressBody)
-                    .addFormDataPart("upload_preset", "wholetv_upload")
-                    .build()
-                val videoRequest = okhttp3.Request.Builder()
-                    .url("https://api.cloudinary.com/v1_1/wholetv/video/upload")
-                    .post(videoMultipartBody)
-                    .build()
-
-                val videoCall = okHttpClient.newCall(videoRequest)
-                coroutineContext[Job]?.invokeOnCompletion {
-                    if (it is kotlinx.coroutines.CancellationException) {
-                        videoCall.cancel()
+                withContext(Dispatchers.IO) {
+                    val context = context
+                    val mimeType = try {
+                        context.contentResolver.getType(videoUri) ?: ""
+                    } catch (e: Exception) {
+                        ""
                     }
-                }
+                    val isVideoMime = mimeType.startsWith("video/") || 
+                            videoUri.toString().endsWith(".mp4", ignoreCase = true) || 
+                            videoUri.toString().endsWith(".mkv", ignoreCase = true) || 
+                            videoUri.toString().endsWith(".webm", ignoreCase = true)
+                    
+                    if (!isVideoMime) {
+                        withContext(Dispatchers.Main) {
+                            _isUploading.value = false
+                            onFailure("MIME type validation failed: Selected file is not a video.")
+                        }
+                        return@withContext
+                    }
 
-                // Execute with up to 3 retries for temporary network failure
-                var videoAttempts = 0
-                val maxAttempts = 3
-                var videoResponse: okhttp3.Response? = null
-                var uploadSuccess = false
-                while (videoAttempts < maxAttempts && !uploadSuccess) {
-                    videoAttempts++
-                    try {
-                        videoResponse = withContext(Dispatchers.IO) { videoCall.execute() }
-                        if (videoResponse.isSuccessful) {
-                            uploadSuccess = true
-                        } else {
-                            if (videoResponse.code >= 500) {
-                                delay(2000L * videoAttempts)
+                    val videoFile = getFileFromUri(context, videoUri)
+                    if (videoFile == null || !videoFile.exists() || !videoFile.canRead()) {
+                        withContext(Dispatchers.Main) {
+                            _isUploading.value = false
+                            onFailure("Failed to access or read the selected video file.")
+                        }
+                        return@withContext
+                    }
+
+                    // Initialize OkHttpClient
+                    val okHttpClient = okhttp3.OkHttpClient.Builder()
+                        .connectTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+                        .readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+                        .writeTimeout(300, java.util.concurrent.TimeUnit.SECONDS)
+                        .build()
+
+                    // Upload Video to Cloudinary
+                    val videoProgressBody = ProgressRequestBody(videoFile, mimeType) { progress ->
+                        _uploadProgressValue.value = progress * 0.8f
+                    }
+                    val videoMultipartBody = okhttp3.MultipartBody.Builder()
+                        .setType(okhttp3.MultipartBody.FORM)
+                        .addFormDataPart("file", videoFile.name, videoProgressBody)
+                        .addFormDataPart("upload_preset", "wholetv_upload")
+                        .build()
+                    val videoRequest = okhttp3.Request.Builder()
+                        .url("https://api.cloudinary.com/v1_1/wholetv/video/upload")
+                        .post(videoMultipartBody)
+                        .build()
+
+                    val videoCall = okHttpClient.newCall(videoRequest)
+                    
+                    // Execute with up to 3 retries for temporary network failure
+                    var videoAttempts = 0
+                    val maxAttempts = 3
+                    var videoResponse: okhttp3.Response? = null
+                    var uploadSuccess = false
+                    while (videoAttempts < maxAttempts && !uploadSuccess) {
+                        videoAttempts++
+                        try {
+                            videoResponse = videoCall.execute()
+                            if (videoResponse.isSuccessful) {
+                                uploadSuccess = true
                             } else {
-                                break
-                            }
-                        }
-                    } catch (e: java.io.IOException) {
-                        if (videoAttempts >= maxAttempts) throw e
-                        delay(2000L * videoAttempts)
-                    }
-                }
-
-                if (videoResponse == null || !videoResponse.isSuccessful) {
-                    val errorMsg = videoResponse?.body?.string() ?: "Network error or invalid response from Cloudinary."
-                    _isUploading.value = false
-                    onFailure("Cloudinary upload failed: $errorMsg")
-                    videoFile.delete()
-                    return@launch
-                }
-
-                val videoResBody = videoResponse.body?.string() ?: ""
-                val videoJson = org.json.JSONObject(videoResBody)
-                val videoUrl = videoJson.getString("secure_url")
-                val publicId = videoJson.getString("public_id")
-                videoFile.delete()
-
-                // Upload Cover Image (if selected) to Cloudinary
-                var posterUrl = ""
-                if (coverUri != null) {
-                    val coverFile = getFileFromUri(context, coverUri)
-                    if (coverFile != null && coverFile.exists() && coverFile.canRead()) {
-                        val coverMimeType = context.contentResolver.getType(coverUri) ?: "image/jpeg"
-                        val coverProgressBody = ProgressRequestBody(coverFile, coverMimeType) { progress ->
-                            _uploadProgressValue.value = 0.8f + (progress * 0.2f)
-                        }
-                        val coverMultipartBody = okhttp3.MultipartBody.Builder()
-                            .setType(okhttp3.MultipartBody.FORM)
-                            .addFormDataPart("file", coverFile.name, coverProgressBody)
-                            .addFormDataPart("upload_preset", "wholetv_upload")
-                            .build()
-                        val coverRequest = okhttp3.Request.Builder()
-                            .url("https://api.cloudinary.com/v1_1/wholetv/image/upload")
-                            .post(coverMultipartBody)
-                            .build()
-
-                        val coverCall = okHttpClient.newCall(coverRequest)
-                        coroutineContext[Job]?.invokeOnCompletion {
-                            if (it is kotlinx.coroutines.CancellationException) {
-                                coverCall.cancel()
-                            }
-                        }
-
-                        var coverAttempts = 0
-                        var coverResponse: okhttp3.Response? = null
-                        var coverSuccess = false
-                        while (coverAttempts < maxAttempts && !coverSuccess) {
-                            coverAttempts++
-                            try {
-                                coverResponse = withContext(Dispatchers.IO) { coverCall.execute() }
-                                if (coverResponse.isSuccessful) {
-                                    coverSuccess = true
+                                if (videoResponse.code >= 500) {
+                                    delay(2000L * videoAttempts)
                                 } else {
-                                    if (coverResponse.code >= 500) {
-                                        delay(2000L * coverAttempts)
-                                    } else {
-                                        break
-                                    }
+                                    break
                                 }
-                            } catch (e: java.io.IOException) {
-                                if (coverAttempts >= maxAttempts) throw e
-                                delay(2000L * coverAttempts)
                             }
+                        } catch (e: java.io.IOException) {
+                            if (videoAttempts >= maxAttempts) throw e
+                            delay(2000L * videoAttempts)
                         }
+                    }
 
-                        if (coverResponse != null && coverResponse.isSuccessful) {
-                            val coverResBody = coverResponse.body?.string() ?: ""
-                            val coverJson = org.json.JSONObject(coverResBody)
-                            posterUrl = coverJson.getString("secure_url")
+                    if (videoResponse == null || !videoResponse.isSuccessful) {
+                        val errorMsg = videoResponse?.body?.string() ?: "Network error or invalid response from Cloudinary."
+                        videoFile.delete()
+                        withContext(Dispatchers.Main) {
+                            _isUploading.value = false
+                            onFailure("Cloudinary upload failed: $errorMsg")
                         }
-                        coverFile.delete()
+                        return@withContext
+                    }
+
+                    val videoResBody = videoResponse.body?.string() ?: ""
+                    val videoJson = org.json.JSONObject(videoResBody)
+                    val videoUrl = videoJson.getString("secure_url")
+                    val publicId = videoJson.getString("public_id")
+                    videoFile.delete()
+
+                    // Upload Cover Image (if selected) to Cloudinary
+                    var posterUrl = ""
+                    if (coverUri != null) {
+                        val coverFile = getFileFromUri(context, coverUri)
+                        if (coverFile != null && coverFile.exists() && coverFile.canRead()) {
+                            val coverMimeType = try {
+                                context.contentResolver.getType(coverUri) ?: "image/jpeg"
+                            } catch (e: Exception) {
+                                "image/jpeg"
+                            }
+                            val coverProgressBody = ProgressRequestBody(coverFile, coverMimeType) { progress ->
+                                _uploadProgressValue.value = 0.8f + (progress * 0.2f)
+                            }
+                            val coverMultipartBody = okhttp3.MultipartBody.Builder()
+                                .setType(okhttp3.MultipartBody.FORM)
+                                .addFormDataPart("file", coverFile.name, coverProgressBody)
+                                .addFormDataPart("upload_preset", "wholetv_upload")
+                                .build()
+                            val coverRequest = okhttp3.Request.Builder()
+                                .url("https://api.cloudinary.com/v1_1/wholetv/image/upload")
+                                .post(coverMultipartBody)
+                                .build()
+
+                            val coverCall = okHttpClient.newCall(coverRequest)
+                            var coverAttempts = 0
+                            var coverResponse: okhttp3.Response? = null
+                            var coverSuccess = false
+                            while (coverAttempts < maxAttempts && !coverSuccess) {
+                                coverAttempts++
+                                try {
+                                    coverResponse = coverCall.execute()
+                                    if (coverResponse.isSuccessful) {
+                                        coverSuccess = true
+                                    } else {
+                                        if (coverResponse.code >= 500) {
+                                            delay(2000L * coverAttempts)
+                                        } else {
+                                            break
+                                        }
+                                    }
+                                } catch (e: java.io.IOException) {
+                                    if (coverAttempts >= maxAttempts) throw e
+                                    delay(2000L * coverAttempts)
+                                }
+                            }
+
+                            if (coverResponse != null && coverResponse.isSuccessful) {
+                                val coverResBody = coverResponse.body?.string() ?: ""
+                                val coverJson = org.json.JSONObject(coverResBody)
+                                posterUrl = coverJson.getString("secure_url")
+                            }
+                            coverFile.delete()
+                        }
+                    }
+
+                    if (posterUrl.isEmpty()) {
+                        posterUrl = "https://images.unsplash.com/photo-1536440136628-849c177e76a1?w=500"
+                    }
+
+                    _uploadProgressValue.value = 1.0f
+
+                    // Insert new MediaItem directly into Room database
+                    val newItem = MediaItem(
+                        title = title.trim(),
+                        description = description.trim(),
+                        category = category.trim(),
+                        hashtags = hashtags.trim(),
+                        qualities = qualities.trim(),
+                        languages = languages.trim(),
+                        rating = rating,
+                        isSlide = isSlide,
+                        badge = badge.trim(),
+                        streamingPlatform = streamingPlatform,
+                        videoUrl = videoUrl,
+                        posterUrl = posterUrl,
+                        uploaderId = currentUserId,
+                        firestoreId = publicId, // Use Cloudinary public ID as unique identifier
+                        views = (100..500).random(),
+                        likes = 0,
+                        shares = 0,
+                        downloads = 0,
+                        timestamp = System.currentTimeMillis(),
+                        genre = genre.trim(),
+                        uploaderName = uploaderName.trim(),
+                        watchTime = 0L
+                    )
+
+                    repository.insertMediaItem(newItem)
+                    withContext(Dispatchers.Main) {
+                        _isUploading.value = false
+                        onSuccess()
                     }
                 }
-
-                if (posterUrl.isEmpty()) {
-                    posterUrl = "https://images.unsplash.com/photo-1536440136628-849c177e76a1?w=500"
-                }
-
-                _uploadProgressValue.value = 1.0f
-
-                // Insert new MediaItem directly into Room database
-                val newItem = MediaItem(
-                    title = title.trim(),
-                    description = description.trim(),
-                    category = category.trim(),
-                    hashtags = hashtags.trim(),
-                    qualities = qualities.trim(),
-                    languages = languages.trim(),
-                    rating = rating,
-                    isSlide = isSlide,
-                    badge = badge.trim(),
-                    streamingPlatform = streamingPlatform,
-                    videoUrl = videoUrl,
-                    posterUrl = posterUrl,
-                    uploaderId = currentUserId,
-                    firestoreId = publicId, // Use Cloudinary public ID as unique identifier
-                    views = (100..500).random(),
-                    likes = 0,
-                    shares = 0,
-                    downloads = 0,
-                    timestamp = System.currentTimeMillis(),
-                    genre = genre.trim(),
-                    uploaderName = uploaderName.trim(),
-                    watchTime = 0L
-                )
-
-                repository.insertMediaItem(newItem)
-                _isUploading.value = false
-                onSuccess()
             } catch (e: Exception) {
-                _isUploading.value = false
-                onFailure(e.localizedMessage ?: "Failed to upload to Cloudinary.")
+                withContext(Dispatchers.Main) {
+                    _isUploading.value = false
+                    onFailure(e.localizedMessage ?: "Failed to upload to Cloudinary.")
+                }
             }
         }
     }
@@ -841,221 +854,7 @@ class MediaViewModel(private val context: android.content.Context, private val r
     }
 
     private suspend fun seedDatabase() {
-        // Seeding database with original show contents as seen in the screenshots
-        val seedItems = listOf(
-            MediaItem(
-                title = "House of the Dragon",
-                description = "The rise and fall of the Targaryen dynasty. High-stakes political war and epic dragon flights set 200 years before Game of Thrones.",
-                category = "TV Shows",
-                hashtags = "#HBOOriginal #Fantasy #WarOfDragons",
-                qualities = "1080p Full HD, 4K Ultra HD",
-                languages = "English, Hindi, Spanish, Multilingual Audio",
-                rating = 8.9,
-                isSlide = true,
-                badge = "New episode",
-                views = 4520380,
-                likes = 890200,
-                shares = 340110,
-                downloads = 560000,
-                streamingPlatform = "Disney+" // HBO original but streaming platforms represent in screenshots
-            ),
-            MediaItem(
-                title = "Your Fault (London)",
-                description = "Nick and Noah's intense love story faces collegiate challenges, career-ending fractures, and family interventions in London.",
-                category = "Movies",
-                hashtags = "#Romance #YourFault #Teens #London",
-                qualities = "1080p HD, 4K Ultra HD",
-                languages = "English, Hindi, Spanish, French, Multilingual",
-                rating = 8.7,
-                isSlide = true,
-                badge = "Trending",
-                views = 2120400,
-                likes = 410200,
-                shares = 150000,
-                downloads = 210000,
-                streamingPlatform = "Prime Video"
-            ),
-            MediaItem(
-                title = "Enola Holmes 3",
-                description = "Enola Holmes starts her own agency in London and takes on a major conspiracy involving missing girls and industrial espionage.",
-                category = "Movies",
-                hashtags = "#Mystery #Detective #EnolaHolmes",
-                qualities = "1080p HD, 4K Ultra HD",
-                languages = "English, Hindi, Spanish, German",
-                rating = 8.3,
-                isSlide = false,
-                badge = "8.3",
-                views = 1820300,
-                likes = 320100,
-                shares = 98000,
-                downloads = 145000,
-                streamingPlatform = "Netflix"
-            ),
-            MediaItem(
-                title = "Toy Story 5",
-                description = "Woody, Buzz, and their toy community find themselves pitted against the ultimate threat of tablets, gaming, and cyber toys.",
-                category = "Movies",
-                hashtags = "#Disney #Animation #Family #Adventure",
-                qualities = "1080p HD, 4K Ultra HD, 3D HD",
-                languages = "English, Hindi, Spanish, Japanese",
-                rating = 8.8,
-                isSlide = false,
-                badge = "8.8",
-                views = 3920000,
-                likes = 750000,
-                shares = 280000,
-                downloads = 480000,
-                streamingPlatform = "Disney+"
-            ),
-            MediaItem(
-                title = "Avatar: The Last Airbender",
-                description = "A live-action reimagining of the beloved animated series following Aang, the young Avatar, as he master elements to defeat Fire Nation.",
-                category = "TV Shows",
-                hashtags = "#Fantasy #LiveAction #Elements #Action",
-                qualities = "1080p HD, 4K Ultra HD",
-                languages = "English, Hindi, Spanish, Japanese, Korean",
-                rating = 8.5,
-                isSlide = false,
-                badge = "Update to 7",
-                views = 5120000,
-                likes = 980000,
-                shares = 420000,
-                downloads = 650000,
-                streamingPlatform = "Netflix"
-            ),
-            MediaItem(
-                title = "Strung",
-                description = "Four extremely talented violinists from diverse backgrounds clash in a high-intensity orchestral reality show battle in Vienna.",
-                category = "Reality-TV",
-                hashtags = "#RealityTV #Violin #MusicDrama",
-                qualities = "1080p HD, 720p HD",
-                languages = "English, Spanish",
-                rating = 8.1,
-                isSlide = false,
-                badge = "Exclusive",
-                views = 980000,
-                likes = 120000,
-                shares = 45000,
-                downloads = 67000,
-                streamingPlatform = "None"
-            ),
-            MediaItem(
-                title = "Wardriver",
-                description = "A brilliant hacker who steals online accounts gets blackmailed by an intelligence agent to perform high-risk terminal intrusions.",
-                category = "Movies",
-                hashtags = "#Thriller #Cyberpunk #Wardriver",
-                qualities = "1080p HD, 4K Ultra HD",
-                languages = "English, German, French",
-                rating = 8.7,
-                isSlide = false,
-                badge = "8.7",
-                views = 1420000,
-                likes = 290000,
-                shares = 110000,
-                downloads = 180000,
-                streamingPlatform = "Netflix"
-            ),
-            MediaItem(
-                title = "Trying - Season 5",
-                description = "A comedic look at Nikki and Jason as they raise adoption teenagers, manage full-time jobs, and try to keep their sanity intact.",
-                category = "TV Shows",
-                hashtags = "#Comedy #Drama #British #Adoption",
-                qualities = "1080p HD",
-                languages = "English, Multilingual Subtitles",
-                rating = 8.6,
-                isSlide = false,
-                badge = "Update to 1",
-                views = 890000,
-                likes = 150000,
-                shares = 50000,
-                downloads = 72000,
-                streamingPlatform = "Disney+"
-            ),
-            MediaItem(
-                title = "Jeff Arcuri: Nice to Meet You",
-                description = "Stand-up comedy star Jeff Arcuri delivers razor-sharp spontaneous crowd work and observational humor in his debut special.",
-                category = "Reality-TV",
-                hashtags = "#Comedy #StandUp #CrowdWork",
-                qualities = "1080p HD, 4K Ultra HD",
-                languages = "English",
-                rating = 8.9,
-                isSlide = false,
-                badge = "8.9",
-                views = 1220000,
-                likes = 210000,
-                shares = 85000,
-                downloads = 95000,
-                streamingPlatform = "Netflix"
-            ),
-            MediaItem(
-                title = "Better Late Than Single",
-                description = "Ten energetic single seniors move into an elite beachfront resort to rewrite the rules of modern romantic partnerships.",
-                category = "Reality-TV",
-                hashtags = "#DatingShow #Comedy #Seniors",
-                qualities = "1080p HD",
-                languages = "English, Spanish",
-                rating = 7.9,
-                isSlide = false,
-                badge = "Update to 4",
-                views = 740000,
-                likes = 95000,
-                shares = 23000,
-                downloads = 31000,
-                streamingPlatform = "Prime Video"
-            ),
-            MediaItem(
-                title = "Nothing to Lose",
-                description = "High school sprinter gets transported into a world of celestial warriors and has to run the race of his life to return home.",
-                category = "Anime",
-                hashtags = "#Anime #SciFi #Isekai #Action",
-                qualities = "1080p HD, 4K Ultra HD",
-                languages = "Japanese (Original), English, Hindi, Spanish",
-                rating = 8.7,
-                isSlide = false,
-                badge = "8.7",
-                views = 2150000,
-                likes = 480000,
-                shares = 190000,
-                downloads = 320000,
-                streamingPlatform = "Prime Video"
-            ),
-            MediaItem(
-                title = "Salcedo: Leather & Boogaloo",
-                description = "Cyberpunk street dancers combine neon gravity boots and high stakes robbery in the gritty underground slums of Neo-Manila.",
-                category = "Anime",
-                hashtags = "#Anime #Mecha #Cyberpunk #Dance",
-                qualities = "1080p HD",
-                languages = "Spanish, Japanese (Original), English",
-                rating = 8.2,
-                isSlide = false,
-                badge = "Update to 12",
-                views = 610000,
-                likes = 84000,
-                shares = 19000,
-                downloads = 22000,
-                streamingPlatform = "Netflix"
-            )
-        )
-
-        for (item in seedItems) {
-            val id = repository.insertMediaItem(item)
-            
-            // Seed 2-3 standard cinematic comments for each movie/show
-            repository.insertComment(
-                Comment(
-                    mediaItemId = id.toInt(),
-                    userName = "CinematicPro",
-                    text = "This looks absolutely stunning in 4K Ultra HD quality! Streaming speed is incredibly stable."
-                )
-            )
-            repository.insertComment(
-                Comment(
-                    mediaItemId = id.toInt(),
-                    userName = "DramaQueen",
-                    text = "Oh my goodness, the cast is exceptional. Easily one of the best releases this season! 🔥"
-                )
-            )
-        }
+        // Clear pre-seeded demo data as requested by user
     }
 }
 
@@ -1075,6 +874,8 @@ class ProgressRequestBody(
     private val onProgress: (progress: Float) -> Unit
 ) : okhttp3.RequestBody() {
 
+    private val handler = android.os.Handler(android.os.Looper.getMainLooper())
+
     override fun contentType(): okhttp3.MediaType? {
         return contentType.toMediaTypeOrNull()
     }
@@ -1087,6 +888,7 @@ class ProgressRequestBody(
         val fileLength = file.length()
         val buffer = ByteArray(4096)
         var uploaded: Long = 0
+        var lastProgressUpdate = 0L
 
         file.inputStream().use { fileInputStream ->
             var read: Int
@@ -1094,7 +896,12 @@ class ProgressRequestBody(
                 sink.write(buffer, 0, read)
                 uploaded += read
                 val progress = if (fileLength > 0) uploaded.toFloat() / fileLength else 0f
-                onProgress(progress)
+                
+                val now = System.currentTimeMillis()
+                if (now - lastProgressUpdate > 100 || progress == 1.0f) {
+                    lastProgressUpdate = now
+                    handler.post { onProgress(progress) }
+                }
             }
         }
     }
