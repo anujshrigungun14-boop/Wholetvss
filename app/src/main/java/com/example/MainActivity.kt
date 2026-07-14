@@ -2933,7 +2933,9 @@ fun UploadDialog(
 
                     // Rocket Legendary Upload trigger
                     Button(
+                        enabled = !isUploading,
                         onClick = {
+                            if (isUploading) return@Button
                             val r = ratingString.toDoubleOrNull() ?: 8.5
                             val finalCategory = categoryInput.trim().ifBlank { "Movies" }
                             if (title.isBlank() || description.isBlank()) {
@@ -2966,7 +2968,10 @@ fun UploadDialog(
                                 )
                             }
                         },
-                        colors = ButtonDefaults.buttonColors(containerColor = MovieRed),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = MovieRed,
+                            disabledContainerColor = MovieRed.copy(alpha = 0.5f)
+                        ),
                         shape = RoundedCornerShape(8.dp),
                         modifier = Modifier
                             .fillMaxWidth()

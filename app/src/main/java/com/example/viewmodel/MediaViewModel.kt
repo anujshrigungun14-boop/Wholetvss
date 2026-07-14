@@ -407,6 +407,13 @@ class MediaViewModel(private val context: android.content.Context, private val r
             if (repository.getCount() == 0) {
                 seedDatabase()
             }
+            // Active deletion of older demo items that have empty firestoreId
+            try {
+                repository.deleteByFirestoreId("")
+                android.util.Log.i("MediaViewModel", "Cleared old demo/seeded items successfully.")
+            } catch (e: Exception) {
+                android.util.Log.e("MediaViewModel", "Failed to clear old demo items", e)
+            }
         }
     }
 
@@ -636,6 +643,11 @@ class MediaViewModel(private val context: android.content.Context, private val r
         onSuccess: () -> Unit,
         onFailure: (String) -> Unit
     ) {
+        if (_isUploading.value) {
+            android.util.Log.w("UploadMedia", "An upload is already in progress. Ignoring duplicate trigger.")
+            onFailure("An upload is already in progress.")
+            return
+        }
         android.util.Log.i("UploadMedia", "[STEP 1: File Selection & URI Validation] Starting upload process...")
         if (videoUri == null) {
             onFailure("selected video URI is null.")
@@ -697,7 +709,8 @@ class MediaViewModel(private val context: android.content.Context, private val r
                         .post(videoMultipartBody)
                         .build()
 
-                    val videoCall = okHttpClient.newCall(videoRequest)
+                    android.util.Log.i("UploadMedia", "[STEP 3: OkHttp Request Creation] Creating video upload request to Cloudinary...")
+                    android.util.Log.i("UploadMedia", "Endpoint: https://api.cloudinary.com/v1_1/wholetv/video/upload")
                     
                     // Execute with up to 3 retries for temporary network failure
                     var videoAttempts = 0
@@ -707,10 +720,14 @@ class MediaViewModel(private val context: android.content.Context, private val r
                     while (videoAttempts < maxAttempts && !uploadSuccess) {
                         videoAttempts++
                         try {
-                            videoResponse = videoCall.execute()
+                            android.util.Log.i("UploadMedia", "Executing video upload attempt $videoAttempts of $maxAttempts...")
+                            val activeCall = okHttpClient.newCall(videoRequest)
+                            videoResponse = activeCall.execute()
+                            android.util.Log.i("UploadMedia", "Video upload response received. Code: ${videoResponse.code}, Success: ${videoResponse.isSuccessful}")
                             if (videoResponse.isSuccessful) {
                                 uploadSuccess = true
                             } else {
+                                android.util.Log.w("UploadMedia", "Video upload attempt $videoAttempts failed with code: ${videoResponse.code}")
                                 if (videoResponse.code >= 500) {
                                     delay(2000L * videoAttempts)
                                 } else {
@@ -718,6 +735,7 @@ class MediaViewModel(private val context: android.content.Context, private val r
                                 }
                             }
                         } catch (e: java.io.IOException) {
+                            android.util.Log.e("UploadMedia", "IOException during video upload attempt $videoAttempts", e)
                             if (videoAttempts >= maxAttempts) throw e
                             delay(2000L * videoAttempts)
                         }
@@ -725,6 +743,7 @@ class MediaViewModel(private val context: android.content.Context, private val r
 
                     if (videoResponse == null || !videoResponse.isSuccessful) {
                         val errorMsg = videoResponse?.body?.string() ?: "Network error or invalid response from Cloudinary."
+                        android.util.Log.e("UploadMedia", "Video upload failed completely. Error: $errorMsg")
                         videoFile.delete()
                         withContext(Dispatchers.Main) {
                             _isUploading.value = false
@@ -762,17 +781,21 @@ class MediaViewModel(private val context: android.content.Context, private val r
                                 .post(coverMultipartBody)
                                 .build()
 
-                            val coverCall = okHttpClient.newCall(coverRequest)
+                            android.util.Log.i("UploadMedia", "[STEP 4: Cover Upload] Creating cover upload request to Cloudinary...")
                             var coverAttempts = 0
                             var coverResponse: okhttp3.Response? = null
                             var coverSuccess = false
                             while (coverAttempts < maxAttempts && !coverSuccess) {
                                 coverAttempts++
                                 try {
-                                    coverResponse = coverCall.execute()
+                                    android.util.Log.i("UploadMedia", "Executing cover upload attempt $coverAttempts of $maxAttempts...")
+                                    val activeCoverCall = okHttpClient.newCall(coverRequest)
+                                    coverResponse = activeCoverCall.execute()
+                                    android.util.Log.i("UploadMedia", "Cover upload response received. Code: ${coverResponse.code}, Success: ${coverResponse.isSuccessful}")
                                     if (coverResponse.isSuccessful) {
                                         coverSuccess = true
                                     } else {
+                                        android.util.Log.w("UploadMedia", "Cover upload attempt $coverAttempts failed with code: ${coverResponse.code}")
                                         if (coverResponse.code >= 500) {
                                             delay(2000L * coverAttempts)
                                         } else {
@@ -780,6 +803,7 @@ class MediaViewModel(private val context: android.content.Context, private val r
                                         }
                                     }
                                 } catch (e: java.io.IOException) {
+                                    android.util.Log.e("UploadMedia", "IOException during cover upload attempt $coverAttempts", e)
                                     if (coverAttempts >= maxAttempts) throw e
                                     delay(2000L * coverAttempts)
                                 }
