@@ -691,7 +691,17 @@ class MediaViewModel(private val context: android.content.Context, private val r
                 } else null
                 
                 val sharedPrefs = context.getSharedPreferences("wholetv_prefs", android.content.Context.MODE_PRIVATE)
-                val backendUrl = sharedPrefs.getString("backend_url", "https://wholetv-backend.onrender.com/api") ?: "https://wholetv-backend.onrender.com/api"
+                var backendUrl = sharedPrefs.getString("backend_url", "https://wholetvss.onrender.com/api") ?: "https://wholetvss.onrender.com/api"
+                if (backendUrl.contains("wholetv-backend.onrender.com")) {
+                    backendUrl = "https://wholetvss.onrender.com/api"
+                    sharedPrefs.edit().putString("backend_url", backendUrl).apply()
+                }
+                if (!backendUrl.endsWith("/api") && !backendUrl.contains("/api/")) {
+                    if (backendUrl.endsWith("/")) {
+                        backendUrl = backendUrl.substring(0, backendUrl.length - 1)
+                    }
+                    backendUrl = "$backendUrl/api"
+                }
                 
                 val uploadId = java.util.UUID.randomUUID().toString()
                 

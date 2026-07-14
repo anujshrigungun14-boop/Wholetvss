@@ -66,11 +66,14 @@ class UploadWorker(
         val currentUserId = inputData.getString("currentUserId") ?: "system"
         
         var backendUrl = inputData.getString("backendUrl") ?: ""
-        if (backendUrl.isBlank() || backendUrl == "direct") {
-            backendUrl = "https://wholetv-backend.onrender.com/api" // fallback
+        if (backendUrl.isBlank() || backendUrl == "direct" || backendUrl.contains("wholetv-backend.onrender.com")) {
+            backendUrl = "https://wholetvss.onrender.com/api" // fallback
         }
         if (backendUrl.endsWith("/")) {
             backendUrl = backendUrl.substring(0, backendUrl.length - 1)
+        }
+        if (!backendUrl.endsWith("/api") && !backendUrl.contains("/api/")) {
+            backendUrl = "$backendUrl/api"
         }
 
         val uploadId = inputData.getString("uploadId") ?: UUID.randomUUID().toString()
