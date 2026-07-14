@@ -15,6 +15,8 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
+import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.*
@@ -2575,6 +2577,12 @@ fun UploadDialog(
 
     val isUploading by viewModel.isUploading.collectAsStateWithLifecycle()
     val uploadProgress by viewModel.uploadProgressValue.collectAsStateWithLifecycle()
+    val uploadSpeed by viewModel.uploadSpeed.collectAsStateWithLifecycle()
+    val uploadedSize by viewModel.uploadedSize.collectAsStateWithLifecycle()
+    val totalSize by viewModel.totalSize.collectAsStateWithLifecycle()
+    val remainingSize by viewModel.remainingSize.collectAsStateWithLifecycle()
+    val uploadEta by viewModel.uploadEta.collectAsStateWithLifecycle()
+    val uploadStatus by viewModel.uploadStatus.collectAsStateWithLifecycle()
 
     val existingCategories by viewModel.categories.collectAsStateWithLifecycle()
     val dynamicCategoriesList = remember(existingCategories) {
@@ -3058,8 +3066,43 @@ fun UploadDialog(
                             Text(
                                 text = "${(uploadProgress * 100).toInt()}% Complete",
                                 color = CinemaGold,
-                                fontSize = 13.sp,
+                                fontSize = 14.sp,
                                 fontWeight = FontWeight.Bold
+                            )
+                            Spacer(modifier = Modifier.height(12.dp))
+                            Text(
+                                text = "Status: $uploadStatus",
+                                color = Color.Gray,
+                                fontSize = 12.sp,
+                                maxLines = 1
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "Speed: $uploadSpeed",
+                                color = SoftWhite,
+                                fontSize = 12.sp
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "$uploadedSize / $totalSize",
+                                color = SoftWhite,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Medium
+                            )
+                            if (remainingSize.isNotBlank()) {
+                                Spacer(modifier = Modifier.height(2.dp))
+                                Text(
+                                    text = "(Remaining: $remainingSize)",
+                                    color = Color.LightGray,
+                                    fontSize = 11.sp
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "ETA: $uploadEta",
+                                color = CinemaGold,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold
                             )
                         }
                     }
@@ -3170,6 +3213,7 @@ fun VideoPlayer(
     var currentPosition by remember { mutableStateOf(0L) }
     var duration by remember { mutableStateOf(0L) }
     var isMuted by remember { mutableStateOf(false) }
+    var scale by remember { mutableStateOf(1f) }
     
     // Gestural Overlays
     var showBrightnessOverlay by remember { mutableStateOf(false) }
@@ -3332,6 +3376,12 @@ fun VideoPlayer(
                     }
                 )
             }
+            .pointerInput(isLocked) {
+                if (isLocked) return@pointerInput
+                detectTransformGestures { _, _, zoom, _ ->
+                    scale = (scale * zoom).coerceIn(1f, 4f)
+                }
+            }
     ) {
         if (exoPlayer != null) {
             AndroidView(
@@ -3345,7 +3395,9 @@ fun VideoPlayer(
                 update = { view ->
                     view.resizeMode = resizeMode
                 },
-                modifier = Modifier.fillMaxSize()
+                modifier = Modifier
+                    .fillMaxSize()
+                    .graphicsLayer(scaleX = scale, scaleY = scale)
             )
         }
 
@@ -3609,6 +3661,27 @@ fun VideoPlayer(
                                     imageVector = Icons.Default.ScreenRotation,
                                     contentDescription = "Screen Orientation Lock",
                                     tint = if (isOrientationLocked) MovieRed else Color.White
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(6.dp))
+
+                            // Picture-in-Picture button
+                            IconButton(
+                                onClick = {
+                                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                                        activity?.enterPictureInPictureMode(
+                                            android.app.PictureInPictureParams.Builder().build()
+                                        )
+                                    } else {
+                                        Toast.makeText(context, "Picture-in-Picture is not supported.", Toast.LENGTH_SHORT).show()
+                                    }
+                                },
+                                modifier = Modifier.background(Color.Black.copy(alpha = 0.4f), CircleShape)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.PictureInPicture,
+                                    contentDescription = "Picture in Picture",
+                                    tint = Color.White
                                 )
                             }
                             Spacer(modifier = Modifier.width(6.dp))

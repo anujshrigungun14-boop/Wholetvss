@@ -390,12 +390,19 @@ class MediaViewModel(private val context: android.content.Context, private val r
         }
     }
 
-    // Upload state variables
+    // Upload state variables (delegated to WorkManager-backed UploadManager)
     private val _isUploading = MutableStateFlow(false)
-    val isUploading: StateFlow<Boolean> = _isUploading.asStateFlow()
-
     private val _uploadProgressValue = MutableStateFlow(0f)
-    val uploadProgressValue: StateFlow<Float> = _uploadProgressValue.asStateFlow()
+    val isUploading: StateFlow<Boolean> = com.example.data.UploadManager.isUploading
+    val uploadProgressValue: StateFlow<Float> = com.example.data.UploadManager.progress
+    val uploadSpeed: StateFlow<String> = com.example.data.UploadManager.speedString
+    val uploadedSize: StateFlow<String> = com.example.data.UploadManager.uploadedSizeString
+    val totalSize: StateFlow<String> = com.example.data.UploadManager.totalSizeString
+    val remainingSize: StateFlow<String> = com.example.data.UploadManager.remainingSizeString
+    val uploadEta: StateFlow<String> = com.example.data.UploadManager.etaString
+    val uploadTitle: StateFlow<String> = com.example.data.UploadManager.uploadTitle
+    val uploadStatus: StateFlow<String> = com.example.data.UploadManager.uploadStatus
+    val uploadError: StateFlow<String?> = com.example.data.UploadManager.error
 
     init {
         // Seed database locally if empty
@@ -409,12 +416,6 @@ class MediaViewModel(private val context: android.content.Context, private val r
                 android.util.Log.i("MediaViewModel", "Cleared old demo/seeded items successfully.")
             } catch (e: Exception) {
                 android.util.Log.e("MediaViewModel", "Failed to clear old demo items", e)
-            }
-            // Resume pending chunked uploads
-            try {
-                resumePendingUploads()
-            } catch (e: Exception) {
-                android.util.Log.e("MediaViewModel", "Failed to auto-resume pending uploads", e)
             }
         }
     }
@@ -626,7 +627,28 @@ class MediaViewModel(private val context: android.content.Context, private val r
         }
     }
 
-    // Custom "Ultra Legendary Fast Upload System" using Cloudinary with Chunked Upload for production scale
+    private fun prepareUploadFile(context: android.content.Context, uri: android.net.Uri, isVideo: Boolean): File? {
+        return try {
+            val resolver = context.contentResolver
+            val mimeType = resolver.getType(uri) ?: (if (isVideo) "video/mp4" else "image/jpeg")
+            val ext = if (isVideo) "mp4" else "jpg"
+            
+            val dir = File(context.cacheDir, "uploads").apply { mkdirs() }
+            val tempFile = File(dir, "up_${System.currentTimeMillis()}_${java.util.UUID.randomUUID().toString().take(6)}.$ext")
+            
+            resolver.openInputStream(uri)?.use { input ->
+                tempFile.outputStream().use { output ->
+                    input.copyTo(output)
+                }
+            }
+            if (tempFile.exists() && tempFile.length() > 0) tempFile else null
+        } catch (e: Exception) {
+            android.util.Log.e("UploadMedia", "Failed to cache file for background upload", e)
+            null
+        }
+    }
+
+    // Modern background upload enqueuer using WorkManager and safe scoped caching
     fun uploadMedia(
         title: String,
         description: String,
@@ -645,86 +667,78 @@ class MediaViewModel(private val context: android.content.Context, private val r
         onSuccess: () -> Unit,
         onFailure: (String) -> Unit
     ) {
-        if (_isUploading.value) {
-            android.util.Log.w("UploadMedia", "An upload is already in progress. Ignoring duplicate trigger.")
-            onFailure("An upload is already in progress.")
-            return
-        }
-        android.util.Log.i("UploadMedia", "[STEP 1: File Selection & URI Validation] Starting upload process...")
         if (videoUri == null) {
-            onFailure("Selected video URI is null.")
+            onFailure("Please select a video file.")
             return
         }
-
+        
         viewModelScope.launch {
-            _isUploading.value = true
-            _uploadProgressValue.value = 0f
-
             try {
                 val context = context
-                val mimeType = try {
-                    context.contentResolver.getType(videoUri) ?: ""
-                } catch (e: Exception) {
-                    ""
-                }
-                val isVideoMime = mimeType.startsWith("video/") || 
-                        videoUri.toString().endsWith(".mp4", ignoreCase = true) || 
-                        videoUri.toString().endsWith(".mkv", ignoreCase = true) || 
-                        videoUri.toString().endsWith(".webm", ignoreCase = true)
-                
-                if (!isVideoMime) {
-                    _isUploading.value = false
-                    onFailure("MIME type validation failed: Selected file is not a video.")
-                    return@launch
-                }
-
-                // Copy input stream to file on Dispatchers.IO
+                // Cache files first to ensure background accessibility
                 val videoFile = withContext(Dispatchers.IO) {
-                    getFileFromUri(context, videoUri)
+                    prepareUploadFile(context, videoUri, true)
                 }
-                if (videoFile == null || !videoFile.exists() || !videoFile.canRead()) {
-                    _isUploading.value = false
-                    onFailure("Failed to access or read the selected video file.")
+                if (videoFile == null || !videoFile.exists()) {
+                    onFailure("Failed to cache video file. Make sure it is readable.")
                     return@launch
                 }
-
+                
                 val coverFile = if (coverUri != null) {
                     withContext(Dispatchers.IO) {
-                        getFileFromUri(context, coverUri)
+                        prepareUploadFile(context, coverUri, false)
                     }
                 } else null
-
-                val uploadId = "wholetv_" + java.util.UUID.randomUUID().toString().replace("-", "")
                 
-                // Save pending upload metadata to SharedPreferences persistently
-                val json = org.json.JSONObject().apply {
-                    put("uploadId", uploadId)
-                    put("filePath", videoFile.absolutePath)
-                    put("coverFilePath", coverFile?.absolutePath ?: "")
-                    put("startByte", 0L)
-                    put("title", title)
-                    put("description", description)
-                    put("category", category)
-                    put("hashtags", hashtags)
-                    put("qualities", qualities)
-                    put("languages", languages)
-                    put("rating", rating)
-                    put("isSlide", isSlide)
-                    put("badge", badge)
-                    put("streamingPlatform", streamingPlatform)
-                    put("genre", genre)
-                    put("uploaderName", uploaderName)
-                    put("currentUserId", currentUserId)
-                }
+                val sharedPrefs = context.getSharedPreferences("wholetv_prefs", android.content.Context.MODE_PRIVATE)
+                val backendUrl = sharedPrefs.getString("backend_url", "https://wholetv-backend.onrender.com/api") ?: "https://wholetv-backend.onrender.com/api"
                 
-                val prefs = context.getSharedPreferences("wholetv_pending_uploads", android.content.Context.MODE_PRIVATE)
-                prefs.edit().putString(uploadId, json.toString()).apply()
-
-                // Execute the actual pipeline
-                executeUploadPipelineWithJson(uploadId, json, onSuccess, onFailure)
+                val uploadId = java.util.UUID.randomUUID().toString()
+                
+                // Reset states
+                com.example.data.UploadManager.reset()
+                com.example.data.UploadManager.updateProgress(
+                    isUploading = true,
+                    progress = 0f,
+                    speed = "0 KB/s",
+                    uploadedSize = "0 MB",
+                    totalSize = "Calculating...",
+                    remainingSize = "Calculating...",
+                    eta = "Calculating...",
+                    title = title,
+                    status = "Starting background worker..."
+                )
+                
+                // Build WorkManager inputs
+                val uploadData = androidx.work.workDataOf(
+                    "videoPath" to videoFile.absolutePath,
+                    "coverPath" to coverFile?.absolutePath,
+                    "title" to title,
+                    "description" to description,
+                    "category" to category,
+                    "hashtags" to hashtags,
+                    "qualities" to qualities,
+                    "languages" to languages,
+                    "rating" to rating,
+                    "isSlide" to isSlide,
+                    "badge" to badge,
+                    "streamingPlatform" to streamingPlatform,
+                    "genre" to genre,
+                    "uploaderName" to uploaderName,
+                    "currentUserId" to currentUserId,
+                    "backendUrl" to backendUrl,
+                    "uploadId" to uploadId
+                )
+                
+                val uploadWorkRequest = androidx.work.OneTimeWorkRequestBuilder<com.company.wholetv.data.UploadWorker>()
+                    .setInputData(uploadData)
+                    .addTag("upload_work_$uploadId")
+                    .build()
+                
+                androidx.work.WorkManager.getInstance(context).enqueue(uploadWorkRequest)
+                onSuccess()
             } catch (e: Exception) {
-                _isUploading.value = false
-                onFailure(e.localizedMessage ?: "Failed to initialize upload.")
+                onFailure(e.localizedMessage ?: "Failed to start background upload.")
             }
         }
     }
