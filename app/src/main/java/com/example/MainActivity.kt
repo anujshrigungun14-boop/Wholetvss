@@ -1614,6 +1614,49 @@ fun MeProfileScreen(viewModel: MediaViewModel) {
             }
         }
 
+        val isUploading by viewModel.isUploading.collectAsStateWithLifecycle()
+        val uploadProgress by viewModel.uploadProgressValue.collectAsStateWithLifecycle()
+
+        if (isUploading) {
+            Spacer(modifier = Modifier.height(16.dp))
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
+                colors = CardDefaults.cardColors(containerColor = DarkSurface),
+                border = BorderStroke(1.dp, MovieRed.copy(alpha = 0.5f))
+            ) {
+                Row(
+                    modifier = Modifier.padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    CircularProgressIndicator(
+                        progress = { uploadProgress },
+                        color = MovieRed,
+                        trackColor = DeepGrey,
+                        modifier = Modifier.size(36.dp)
+                    )
+                    Spacer(modifier = Modifier.width(16.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Uploading to Cloud...",
+                            color = SoftWhite,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        val pct = (uploadProgress * 100).toInt().coerceIn(0, 100)
+                        Text(
+                            text = "Progress: $pct%",
+                            color = CinemaGold,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                }
+            }
+        }
+
         Spacer(modifier = Modifier.height(24.dp))
 
         SectionHeader(title = "My Offline Downloads")
@@ -2540,10 +2583,10 @@ fun UploadDialog(
     val platformsList = listOf("None", "Netflix", "Disney+", "Prime Video")
 
     Dialog(
-        onDismissRequest = { if (!isUploading) onDismiss() },
+        onDismissRequest = onDismiss,
         properties = DialogProperties(
-            dismissOnBackPress = !isUploading,
-            dismissOnClickOutside = !isUploading,
+            dismissOnBackPress = true,
+            dismissOnClickOutside = true,
             usePlatformDefaultWidth = false
         )
     ) {
@@ -2566,7 +2609,7 @@ fun UploadDialog(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     IconButton(
-                        onClick = { if (!isUploading) onDismiss() },
+                        onClick = onDismiss,
                         modifier = Modifier.testTag("upload_back_button")
                     ) {
                         Icon(

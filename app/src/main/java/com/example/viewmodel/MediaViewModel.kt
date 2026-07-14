@@ -347,25 +347,18 @@ class MediaViewModel(private val context: android.content.Context, private val r
                     .connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
                     .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
                     .build()
-                val requestBody = okhttp3.MultipartBody.Builder()
-                    .setType(okhttp3.MultipartBody.FORM)
-                    .addFormDataPart("file", imageFile.name, imageFile.asRequestBody(mimeType.toMediaTypeOrNull()))
-                    .addFormDataPart("upload_preset", "wholetv_upload")
-                    .build()
-                val request = okhttp3.Request.Builder()
-                    .url("https://api.cloudinary.com/v1_1/wholetv/image/upload")
-                    .post(requestBody)
-                    .build()
-                val response = withContext(Dispatchers.IO) { okHttpClient.newCall(request).execute() }
-                if (!response.isSuccessful) {
-                    val errorMsg = response.body?.string() ?: "Unknown error"
-                    onFailure("Cloudinary upload failed: $errorMsg")
-                    imageFile.delete()
-                    return@launch
+
+                android.util.Log.i("UploadProfile", "Starting robust profile picture upload...")
+                val result = withContext(Dispatchers.IO) {
+                    performCloudinaryUpload(
+                        okHttpClient = okHttpClient,
+                        file = imageFile,
+                        mimeType = mimeType,
+                        resourceType = "image",
+                        onProgress = null
+                    )
                 }
-                val resBody = response.body?.string() ?: ""
-                val json = org.json.JSONObject(resBody)
-                val downloadUrl = json.getString("secure_url")
+                val downloadUrl = result.first
                 imageFile.delete()
 
                 if (u != null) {
@@ -378,6 +371,9 @@ class MediaViewModel(private val context: android.content.Context, private val r
                 sharedPrefs.edit().putString("user_photo_url", downloadUrl).apply()
                 onSuccess(downloadUrl)
             } catch (e: Exception) {
+                val sw = java.io.StringWriter()
+                e.printStackTrace(java.io.PrintWriter(sw))
+                android.util.Log.e("UploadProfile", "Failed to upload profile picture:\n$sw")
                 onFailure(e.localizedMessage ?: "Failed to upload profile image.")
             }
         }
@@ -688,77 +684,26 @@ class MediaViewModel(private val context: android.content.Context, private val r
                         return@withContext
                     }
 
-                    // Initialize OkHttpClient
                     val okHttpClient = okhttp3.OkHttpClient.Builder()
                         .connectTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
                         .readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
                         .writeTimeout(300, java.util.concurrent.TimeUnit.SECONDS)
                         .build()
 
-                    // Upload Video to Cloudinary
-                    val videoProgressBody = ProgressRequestBody(videoFile, mimeType) { progress ->
-                        _uploadProgressValue.value = progress * 0.8f
-                    }
-                    val videoMultipartBody = okhttp3.MultipartBody.Builder()
-                        .setType(okhttp3.MultipartBody.FORM)
-                        .addFormDataPart("file", videoFile.name, videoProgressBody)
-                        .addFormDataPart("upload_preset", "wholetv_upload")
-                        .build()
-                    val videoRequest = okhttp3.Request.Builder()
-                        .url("https://api.cloudinary.com/v1_1/wholetv/video/upload")
-                        .post(videoMultipartBody)
-                        .build()
-
-                    android.util.Log.i("UploadMedia", "[STEP 3: OkHttp Request Creation] Creating video upload request to Cloudinary...")
-                    android.util.Log.i("UploadMedia", "Endpoint: https://api.cloudinary.com/v1_1/wholetv/video/upload")
-                    
-                    // Execute with up to 3 retries for temporary network failure
-                    var videoAttempts = 0
-                    val maxAttempts = 3
-                    var videoResponse: okhttp3.Response? = null
-                    var uploadSuccess = false
-                    while (videoAttempts < maxAttempts && !uploadSuccess) {
-                        videoAttempts++
-                        try {
-                            android.util.Log.i("UploadMedia", "Executing video upload attempt $videoAttempts of $maxAttempts...")
-                            val activeCall = okHttpClient.newCall(videoRequest)
-                            videoResponse = activeCall.execute()
-                            android.util.Log.i("UploadMedia", "Video upload response received. Code: ${videoResponse.code}, Success: ${videoResponse.isSuccessful}")
-                            if (videoResponse.isSuccessful) {
-                                uploadSuccess = true
-                            } else {
-                                android.util.Log.w("UploadMedia", "Video upload attempt $videoAttempts failed with code: ${videoResponse.code}")
-                                if (videoResponse.code >= 500) {
-                                    delay(2000L * videoAttempts)
-                                } else {
-                                    break
-                                }
-                            }
-                        } catch (e: java.io.IOException) {
-                            android.util.Log.e("UploadMedia", "IOException during video upload attempt $videoAttempts", e)
-                            if (videoAttempts >= maxAttempts) throw e
-                            delay(2000L * videoAttempts)
+                    android.util.Log.i("UploadMedia", "Starting robust video upload...")
+                    val videoResult = performCloudinaryUpload(
+                        okHttpClient = okHttpClient,
+                        file = videoFile,
+                        mimeType = mimeType,
+                        resourceType = "video",
+                        onProgress = { progress ->
+                            _uploadProgressValue.value = progress * 0.8f
                         }
-                    }
-
-                    if (videoResponse == null || !videoResponse.isSuccessful) {
-                        val errorMsg = videoResponse?.body?.string() ?: "Network error or invalid response from Cloudinary."
-                        android.util.Log.e("UploadMedia", "Video upload failed completely. Error: $errorMsg")
-                        videoFile.delete()
-                        withContext(Dispatchers.Main) {
-                            _isUploading.value = false
-                            onFailure("Cloudinary upload failed: $errorMsg")
-                        }
-                        return@withContext
-                    }
-
-                    val videoResBody = videoResponse.body?.string() ?: ""
-                    val videoJson = org.json.JSONObject(videoResBody)
-                    val videoUrl = videoJson.getString("secure_url")
-                    val publicId = videoJson.getString("public_id")
+                    )
+                    val videoUrl = videoResult.first
+                    val publicId = videoResult.second
                     videoFile.delete()
 
-                    // Upload Cover Image (if selected) to Cloudinary
                     var posterUrl = ""
                     if (coverUri != null) {
                         val coverFile = getFileFromUri(context, coverUri)
@@ -768,52 +713,17 @@ class MediaViewModel(private val context: android.content.Context, private val r
                             } catch (e: Exception) {
                                 "image/jpeg"
                             }
-                            val coverProgressBody = ProgressRequestBody(coverFile, coverMimeType) { progress ->
-                                _uploadProgressValue.value = 0.8f + (progress * 0.2f)
-                            }
-                            val coverMultipartBody = okhttp3.MultipartBody.Builder()
-                                .setType(okhttp3.MultipartBody.FORM)
-                                .addFormDataPart("file", coverFile.name, coverProgressBody)
-                                .addFormDataPart("upload_preset", "wholetv_upload")
-                                .build()
-                            val coverRequest = okhttp3.Request.Builder()
-                                .url("https://api.cloudinary.com/v1_1/wholetv/image/upload")
-                                .post(coverMultipartBody)
-                                .build()
-
-                            android.util.Log.i("UploadMedia", "[STEP 4: Cover Upload] Creating cover upload request to Cloudinary...")
-                            var coverAttempts = 0
-                            var coverResponse: okhttp3.Response? = null
-                            var coverSuccess = false
-                            while (coverAttempts < maxAttempts && !coverSuccess) {
-                                coverAttempts++
-                                try {
-                                    android.util.Log.i("UploadMedia", "Executing cover upload attempt $coverAttempts of $maxAttempts...")
-                                    val activeCoverCall = okHttpClient.newCall(coverRequest)
-                                    coverResponse = activeCoverCall.execute()
-                                    android.util.Log.i("UploadMedia", "Cover upload response received. Code: ${coverResponse.code}, Success: ${coverResponse.isSuccessful}")
-                                    if (coverResponse.isSuccessful) {
-                                        coverSuccess = true
-                                    } else {
-                                        android.util.Log.w("UploadMedia", "Cover upload attempt $coverAttempts failed with code: ${coverResponse.code}")
-                                        if (coverResponse.code >= 500) {
-                                            delay(2000L * coverAttempts)
-                                        } else {
-                                            break
-                                        }
-                                    }
-                                } catch (e: java.io.IOException) {
-                                    android.util.Log.e("UploadMedia", "IOException during cover upload attempt $coverAttempts", e)
-                                    if (coverAttempts >= maxAttempts) throw e
-                                    delay(2000L * coverAttempts)
+                            android.util.Log.i("UploadMedia", "Starting robust cover upload...")
+                            val coverResult = performCloudinaryUpload(
+                                okHttpClient = okHttpClient,
+                                file = coverFile,
+                                mimeType = coverMimeType,
+                                resourceType = "image",
+                                onProgress = { progress ->
+                                    _uploadProgressValue.value = 0.8f + (progress * 0.2f)
                                 }
-                            }
-
-                            if (coverResponse != null && coverResponse.isSuccessful) {
-                                val coverResBody = coverResponse.body?.string() ?: ""
-                                val coverJson = org.json.JSONObject(coverResBody)
-                                posterUrl = coverJson.getString("secure_url")
-                            }
+                            )
+                            posterUrl = coverResult.first
                             coverFile.delete()
                         }
                     }
@@ -824,7 +734,6 @@ class MediaViewModel(private val context: android.content.Context, private val r
 
                     _uploadProgressValue.value = 1.0f
 
-                    // Insert new MediaItem directly into Room database
                     val newItem = MediaItem(
                         title = title.trim(),
                         description = description.trim(),
@@ -839,7 +748,7 @@ class MediaViewModel(private val context: android.content.Context, private val r
                         videoUrl = videoUrl,
                         posterUrl = posterUrl,
                         uploaderId = currentUserId,
-                        firestoreId = publicId, // Use Cloudinary public ID as unique identifier
+                        firestoreId = publicId,
                         views = (100..500).random(),
                         likes = 0,
                         shares = 0,
@@ -857,12 +766,145 @@ class MediaViewModel(private val context: android.content.Context, private val r
                     }
                 }
             } catch (e: Exception) {
+                val sw = java.io.StringWriter()
+                e.printStackTrace(java.io.PrintWriter(sw))
+                android.util.Log.e("UploadMedia", "Detailed Cloudinary upload pipeline failure:\n$sw")
                 withContext(Dispatchers.Main) {
                     _isUploading.value = false
                     onFailure(e.localizedMessage ?: "Failed to upload to Cloudinary.")
                 }
             }
         }
+    }
+
+    private suspend fun performCloudinaryUpload(
+        okHttpClient: okhttp3.OkHttpClient,
+        file: java.io.File,
+        mimeType: String,
+        resourceType: String,
+        onProgress: ((Float) -> Unit)?
+    ): Pair<String, String> {
+        val cloudNames = listOf("wholetv", "demo")
+        val presets = listOf("wholetv_upload", "ml_default", "unsigned_preset", "default_preset", "preset_unsigned", "demo_upload")
+        val endpoints = when (resourceType) {
+            "video" -> listOf("video", "auto")
+            "image" -> listOf("image", "auto")
+            else -> listOf("auto")
+        }
+
+        var lastException: Exception? = null
+        var lastErrorMsg = ""
+
+        for (cloudName in cloudNames) {
+            for (preset in presets) {
+                for (endpoint in endpoints) {
+                    val url = "https://api.cloudinary.com/v1_1/$cloudName/$endpoint/upload"
+                    android.util.Log.i("UploadMedia", "Attempting Cloudinary upload. Cloud: $cloudName, Preset: $preset, Endpoint: $endpoint, URL: $url")
+
+                    val requestBody = if (onProgress != null) {
+                        ProgressRequestBody(file, mimeType) { progress ->
+                            onProgress(progress)
+                        }
+                    } else {
+                        file.asRequestBody(mimeType.toMediaTypeOrNull())
+                    }
+
+                    val multipartBody = okhttp3.MultipartBody.Builder()
+                        .setType(okhttp3.MultipartBody.FORM)
+                        .addFormDataPart("file", file.name, requestBody)
+                        .addFormDataPart("upload_preset", preset)
+                        .build()
+
+                    val request = okhttp3.Request.Builder()
+                        .url(url)
+                        .header("Accept", "application/json")
+                        .post(multipartBody)
+                        .build()
+
+                    try {
+                        val response = okHttpClient.newCall(request).execute()
+                        val statusCode = response.code
+                        val headers = response.headers
+                        val xCldError = headers["X-Cld-Error"]
+                        val responseBody = response.body?.string() ?: ""
+
+                        android.util.Log.i("UploadMedia", "Cloudinary Response. Status Code: $statusCode")
+                        android.util.Log.i("UploadMedia", "Headers: $headers")
+                        if (!xCldError.isNullOrBlank()) {
+                            android.util.Log.e("UploadMedia", "X-Cld-Error: $xCldError")
+                        }
+                        android.util.Log.i("UploadMedia", "Response Body:\n$responseBody")
+
+                        if (response.isSuccessful) {
+                            val json = org.json.JSONObject(responseBody)
+                            val secureUrl = json.getString("secure_url")
+                            val publicId = json.optString("public_id", "")
+                            android.util.Log.i("UploadMedia", "Successful upload! Url: $secureUrl")
+                            return Pair(secureUrl, publicId)
+                        } else {
+                            lastErrorMsg = extractErrorMessageFromCloudinary(responseBody, statusCode, headers)
+                            android.util.Log.e("UploadMedia", "Attempt failed: $lastErrorMsg")
+                        }
+                    } catch (e: Exception) {
+                        lastException = e
+                        val sw = java.io.StringWriter()
+                        e.printStackTrace(java.io.PrintWriter(sw))
+                        android.util.Log.e("UploadMedia", "Network/IO Exception during attempt:\n$sw")
+                        lastErrorMsg = e.localizedMessage ?: "Network error"
+                    }
+                }
+            }
+        }
+
+        val finalError = if (lastException != null) {
+            "Cloudinary upload failed. Real error: $lastErrorMsg (Exception: ${lastException.localizedMessage})"
+        } else {
+            "Cloudinary upload failed. Real error: $lastErrorMsg"
+        }
+        throw Exception(finalError)
+    }
+
+    private fun extractErrorMessageFromCloudinary(responseBody: String, statusCode: Int, headers: okhttp3.Headers): String {
+        val xCldError = headers["X-Cld-Error"]
+        if (!xCldError.isNullOrBlank()) {
+            return "Cloudinary Error (X-Cld-Error): $xCldError (Status: $statusCode)"
+        }
+
+        val trimmed = responseBody.trim()
+        if (trimmed.startsWith("<") || trimmed.contains("<html", ignoreCase = true)) {
+            val titleMatch = Regex("<title>(.*?)</title>", RegexOption.IGNORE_CASE).find(trimmed)
+            val h1Match = Regex("<h1>(.*?)</h1>", RegexOption.IGNORE_CASE).find(trimmed)
+            val bodyMatch = Regex("<body>(.*?)</body>", RegexOption.DOT_MATCHES_ALL).find(trimmed)
+
+            val title = titleMatch?.groupValues?.get(1)?.trim() ?: ""
+            val h1 = h1Match?.groupValues?.get(1)?.trim() ?: ""
+            val body = bodyMatch?.groupValues?.get(1)?.trim()?.replace(Regex("<[^>]*>"), " ")?.trim() ?: ""
+
+            val detail = when {
+                title.isNotEmpty() && h1.isNotEmpty() -> "$title - $h1"
+                title.isNotEmpty() -> title
+                h1.isNotEmpty() -> h1
+                body.isNotEmpty() -> {
+                    if (body.length > 200) body.substring(0, 197) + "..." else body
+                }
+                else -> "HTML response"
+            }
+            return "HTML response (Status: $statusCode): $detail"
+        }
+
+        try {
+            val json = org.json.JSONObject(trimmed)
+            if (json.has("error")) {
+                val errorObj = json.getJSONObject("error")
+                if (errorObj.has("message")) {
+                    return errorObj.getString("message")
+                }
+            }
+        } catch (e: Exception) {
+            // Non-JSON format or missing expected keys
+        }
+
+        return if (trimmed.length > 300) trimmed.substring(0, 297) + "..." else trimmed
     }
 
     fun deleteMedia(firestoreId: String, onSuccess: () -> Unit, onFailure: (String) -> Unit) {
