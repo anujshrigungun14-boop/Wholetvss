@@ -73,6 +73,13 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+
+        // Set global uncaught exception handler to capture FATAL EXCEPTION stack traces
+        val originalHandler = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+            android.util.Log.e("FATAL_EXCEPTION", "💥 [FATAL CRASH DETECTED] Thread: ${thread.name} | Exception: ${throwable.javaClass.simpleName} - ${throwable.message}", throwable)
+            originalHandler?.uncaughtException(thread, throwable)
+        }
         
         try {
             com.google.firebase.FirebaseApp.initializeApp(this)
@@ -1618,6 +1625,25 @@ fun MeProfileScreen(viewModel: MediaViewModel) {
 
         val isUploading by viewModel.isUploading.collectAsStateWithLifecycle()
         val uploadProgress by viewModel.uploadProgressValue.collectAsStateWithLifecycle()
+        val myUploadedMedia by viewModel.myUploadedMedia.collectAsStateWithLifecycle()
+
+        if (myUploadedMedia.isNotEmpty()) {
+            Spacer(modifier = Modifier.height(16.dp))
+            SectionHeader(title = "My Uploaded Content")
+            LazyRow(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(start = 12.dp, bottom = 12.dp),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                items(myUploadedMedia) { item ->
+                    MediaCard(
+                        item = item,
+                        onClick = { viewModel.selectMedia(item.id) }
+                    )
+                }
+            }
+        }
 
         if (isUploading) {
             Spacer(modifier = Modifier.height(16.dp))
@@ -3253,14 +3279,22 @@ fun VideoPlayer(
     // Save playback position periodically and on dispose, clean up status/navigation bar and screen orientation
     DisposableEffect(exoPlayer) {
         onDispose {
-            exoPlayer?.let {
-                val prefs = context.getSharedPreferences("wholetv_playback_resume", android.content.Context.MODE_PRIVATE)
-                prefs.edit().putLong(safeVideoUrl, it.currentPosition).apply()
-                it.release()
+            try {
+                exoPlayer?.let { player ->
+                    val prefs = context.getSharedPreferences("wholetv_playback_resume", android.content.Context.MODE_PRIVATE)
+                    try {
+                        prefs.edit().putLong(safeVideoUrl, player.currentPosition).apply()
+                    } catch (_: Exception) {}
+                    player.release()
+                }
+            } catch (e: Exception) {
+                android.util.Log.e("VideoPlayer", "Error during ExoPlayer dispose", e)
             }
             activity?.let { act ->
-                toggleSystemUI(act, false)
-                act.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                try {
+                    toggleSystemUI(act, false)
+                    act.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                } catch (_: Exception) {}
             }
         }
     }
@@ -3268,19 +3302,23 @@ fun VideoPlayer(
     // Automatic screen rotation and immersive mode state machine
     LaunchedEffect(isFullscreen, isOrientationLocked) {
         activity?.let { act ->
-            toggleSystemUI(act, isFullscreen)
-            if (isOrientationLocked) {
-                act.requestedOrientation = if (isFullscreen) {
-                    android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+            try {
+                toggleSystemUI(act, isFullscreen)
+                if (isOrientationLocked) {
+                    act.requestedOrientation = if (isFullscreen) {
+                        android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+                    } else {
+                        android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                    }
                 } else {
-                    android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                    act.requestedOrientation = if (isFullscreen) {
+                        android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                    } else {
+                        android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                    }
                 }
-            } else {
-                act.requestedOrientation = if (isFullscreen) {
-                    android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-                } else {
-                    android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-                }
+            } catch (e: Exception) {
+                android.util.Log.e("VideoPlayer", "Error toggling system UI orientation", e)
             }
         }
     }
@@ -3288,9 +3326,13 @@ fun VideoPlayer(
     // Sync play state
     LaunchedEffect(exoPlayer) {
         while (exoPlayer != null) {
-            currentPosition = exoPlayer.currentPosition
-            duration = exoPlayer.duration.coerceAtLeast(0L)
-            isPlayingState = exoPlayer.isPlaying
+            try {
+                currentPosition = exoPlayer.currentPosition
+                duration = exoPlayer.duration.coerceAtLeast(0L)
+                isPlayingState = exoPlayer.isPlaying
+            } catch (e: Exception) {
+                break
+            }
             delay(250)
         }
     }

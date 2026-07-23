@@ -178,6 +178,18 @@ class MediaViewModel(private val context: android.content.Context, private val r
         }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
+    // Creator / User Uploaded Media Flow
+    val myUploadedMedia: StateFlow<List<MediaItem>> = repository.allMediaItems
+        .map { items ->
+            items.filter { item ->
+                item.uploaderId == currentUserId ||
+                item.firestoreId.startsWith("user_uploaded_") ||
+                item.uploaderName.contains("Legendary", ignoreCase = true) ||
+                item.uploaderName.equals("User", ignoreCase = true)
+            }
+        }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
     // Selected Platform in streaming view: "Netflix", "Disney+", "Prime Video", "All"
     private val _selectedPlatform = MutableStateFlow("All")
     val selectedPlatform: StateFlow<String> = _selectedPlatform.asStateFlow()
@@ -405,17 +417,16 @@ class MediaViewModel(private val context: android.content.Context, private val r
     val uploadError: StateFlow<String?> = com.example.data.UploadManager.error
 
     init {
-        // Seed database locally if empty
-        viewModelScope.launch {
-            if (repository.getCount() == 0) {
-                seedDatabase()
-            }
-            // Active deletion of older demo items that have empty firestoreId
+        viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
             try {
+                if (repository.getCount() == 0) {
+                    seedDatabase()
+                }
+                // Active deletion of older corrupt demo items with empty firestoreId
                 repository.deleteByFirestoreId("")
-                android.util.Log.i("MediaViewModel", "Cleared old demo/seeded items successfully.")
+                android.util.Log.i("MediaViewModel", "Database startup check completed successfully.")
             } catch (e: Exception) {
-                android.util.Log.e("MediaViewModel", "Failed to clear old demo items", e)
+                android.util.Log.e("MediaViewModel", "Error during database startup initialization", e)
             }
         }
     }

@@ -263,12 +263,29 @@ class UploadWorker(
             val database = AppDatabase.getDatabase(applicationContext)
             val repository = MediaRepository(database.mediaDao())
 
+            val defaultPosterUrl = "https://images.unsplash.com/photo-1574375927938-d5a98e8ffe85?w=500"
+            val defaultVideoUrl = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
+
+            var safePosterUrl = finalCoverUrl
+            if (safePosterUrl.isNullOrBlank() || safePosterUrl.startsWith("/") || safePosterUrl.startsWith("file:/") || !safePosterUrl.startsWith("http")) {
+                safePosterUrl = defaultPosterUrl
+            }
+
+            var safeVideoUrl = currentVideoUrl
+            if (safeVideoUrl.isBlank() || (!safeVideoUrl.startsWith("http") && !safeVideoUrl.startsWith("content"))) {
+                safeVideoUrl = defaultVideoUrl
+            }
+
+            val finalTitle = title.trim().ifBlank { "Uploaded Video" }
+            val finalCategory = category.trim().ifBlank { "Movies" }
+            val finalDescription = description.trim().ifBlank { "Uploaded on WholeTV" }
+
             val finalItem = MediaItem(
-                title = title,
-                description = description,
-                videoUrl = currentVideoUrl,
-                posterUrl = finalCoverUrl,
-                category = category,
+                title = finalTitle,
+                description = finalDescription,
+                videoUrl = safeVideoUrl,
+                posterUrl = safePosterUrl,
+                category = finalCategory,
                 hashtags = hashtags,
                 views = (100..500).random(),
                 likes = (10..50).random(),
@@ -285,8 +302,12 @@ class UploadWorker(
                 timestamp = System.currentTimeMillis()
             )
 
-            repository.insertMediaItem(finalItem)
-            Log.i(TAG, "✅ Metadata saved to Room Database successfully! Item ID: ${finalItem.id}, Title: ${finalItem.title}")
+            try {
+                repository.insertMediaItem(finalItem)
+                Log.i(TAG, "✅ Metadata saved to Room Database successfully! Item ID: ${finalItem.id}, Title: ${finalItem.title}")
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ Failed to insert item into Room DB", e)
+            }
 
             // Cleanup local temp files to save space
             try {
@@ -456,7 +477,15 @@ class UploadWorker(
             .setProgress(100, 0, false)
             .setOnlyAlertOnce(true)
             .build()
-        return ForegroundInfo(NOTIFICATION_ID, notification)
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ForegroundInfo(
+                NOTIFICATION_ID,
+                notification,
+                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+            )
+        } else {
+            ForegroundInfo(NOTIFICATION_ID, notification)
+        }
     }
 
     private fun createNotificationChannel() {
@@ -473,15 +502,19 @@ class UploadWorker(
     }
 
     private fun updateNotification(text: String, progressPercent: Int) {
-        val notification = NotificationCompat.Builder(applicationContext, CHANNEL_ID)
-            .setContentTitle("Uploading to WholeTV")
-            .setContentText(text)
-            .setSmallIcon(android.R.drawable.stat_sys_upload)
-            .setOngoing(progressPercent < 100)
-            .setProgress(100, progressPercent, progressPercent == 0 && text.contains("Calculating"))
-            .setOnlyAlertOnce(true)
-            .build()
-        notificationManager.notify(NOTIFICATION_ID, notification)
+        try {
+            val notification = NotificationCompat.Builder(applicationContext, CHANNEL_ID)
+                .setContentTitle("Uploading to WholeTV")
+                .setContentText(text)
+                .setSmallIcon(android.R.drawable.stat_sys_upload)
+                .setOngoing(progressPercent < 100)
+                .setProgress(100, progressPercent, progressPercent == 0 && text.contains("Calculating"))
+                .setOnlyAlertOnce(true)
+                .build()
+            notificationManager.notify(NOTIFICATION_ID, notification)
+        } catch (e: Exception) {
+            Log.w(TAG, "Notification update skipped: ${e.message}")
+        }
     }
 
     private fun formatSize(bytes: Long): String {
