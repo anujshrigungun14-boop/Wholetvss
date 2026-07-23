@@ -628,22 +628,36 @@ class MediaViewModel(private val context: android.content.Context, private val r
     }
 
     private fun prepareUploadFile(context: android.content.Context, uri: android.net.Uri, isVideo: Boolean): File? {
+        val tag = if (isVideo) "VideoFile" else "CoverFile"
+        android.util.Log.i("UploadMedia", "Validating & opening InputStream for $tag from URI: $uri")
         return try {
             val resolver = context.contentResolver
-            val mimeType = resolver.getType(uri) ?: (if (isVideo) "video/mp4" else "image/jpeg")
             val ext = if (isVideo) "mp4" else "jpg"
             
             val dir = File(context.cacheDir, "uploads").apply { mkdirs() }
             val tempFile = File(dir, "up_${System.currentTimeMillis()}_${java.util.UUID.randomUUID().toString().take(6)}.$ext")
             
-            resolver.openInputStream(uri)?.use { input ->
+            val inputStream = resolver.openInputStream(uri)
+            if (inputStream == null) {
+                android.util.Log.e("UploadMedia", "Failed to open InputStream for $tag URI: $uri")
+                return null
+            }
+
+            android.util.Log.i("UploadMedia", "InputStream opened successfully. Caching $tag bytes to local path: ${tempFile.absolutePath}")
+            inputStream.use { input ->
                 tempFile.outputStream().use { output ->
                     input.copyTo(output)
                 }
             }
-            if (tempFile.exists() && tempFile.length() > 0) tempFile else null
+            if (tempFile.exists() && tempFile.length() > 0) {
+                android.util.Log.i("UploadMedia", "$tag cached successfully! Size: ${tempFile.length()} bytes")
+                tempFile
+            } else {
+                android.util.Log.e("UploadMedia", "$tag cached file is empty or missing")
+                null
+            }
         } catch (e: Exception) {
-            android.util.Log.e("UploadMedia", "Failed to cache file for background upload", e)
+            android.util.Log.e("UploadMedia", "Failed to cache $tag from URI: $uri", e)
             null
         }
     }
@@ -667,28 +681,82 @@ class MediaViewModel(private val context: android.content.Context, private val r
         onSuccess: () -> Unit,
         onFailure: (String) -> Unit
     ) {
-        if (videoUri == null) {
-            onFailure("Please select a video file.")
+        android.util.Log.i("UploadMedia", "==========================================================")
+        android.util.Log.i("UploadMedia", "Upload button clicked - Starting validation...")
+        
+        if (com.example.data.UploadManager.isUploading.value) {
+            android.util.Log.w("UploadMedia", "Upload already in progress. Ignoring duplicate click.")
+            onFailure("An upload is already in progress.")
             return
         }
+
+        if (title.isBlank() || description.isBlank()) {
+            val err = "Please fill out required title and description fields."
+            android.util.Log.w("UploadMedia", "Validation failed: $err")
+            onFailure(err)
+            return
+        }
+
+        if (videoUri == null) {
+            val err = "Please select a video file."
+            android.util.Log.w("UploadMedia", "Validation failed: $err")
+            onFailure(err)
+            return
+        }
+
+        android.util.Log.i("UploadMedia", "Validation passed! Title: '$title', Category: '$category', Video URI: $videoUri, Cover URI: $coverUri")
         
+        // Immediately set UploadManager state to true so UI disables button and displays progress card instantly!
+        com.example.data.UploadManager.reset()
+        com.example.data.UploadManager.updateProgress(
+            isUploading = true,
+            progress = 0f,
+            speed = "0 KB/s",
+            uploadedSize = "0 MB",
+            totalSize = "Preparing...",
+            remainingSize = "Preparing...",
+            eta = "Calculating...",
+            title = title,
+            status = "Caching video file..."
+        )
+
         viewModelScope.launch {
             try {
                 val context = context
                 // Cache files first to ensure background accessibility
+                android.util.Log.i("UploadMedia", "Caching video file for background WorkManager execution...")
                 val videoFile = withContext(Dispatchers.IO) {
                     prepareUploadFile(context, videoUri, true)
                 }
                 if (videoFile == null || !videoFile.exists()) {
-                    onFailure("Failed to cache video file. Make sure it is readable.")
+                    val err = "Failed to cache video file ($videoUri). Ensure the file is valid and accessible."
+                    android.util.Log.e("UploadMedia", err)
+                    com.example.data.UploadManager.updateProgress(
+                        isUploading = false,
+                        progress = 0f,
+                        speed = "0 KB/s",
+                        uploadedSize = "0 MB",
+                        totalSize = "0 MB",
+                        remainingSize = "0 MB",
+                        eta = "Error",
+                        title = title,
+                        status = "Failed",
+                        errorMsg = err
+                    )
+                    onFailure(err)
                     return@launch
                 }
                 
                 val coverFile = if (coverUri != null) {
+                    android.util.Log.i("UploadMedia", "Caching cover image...")
                     withContext(Dispatchers.IO) {
                         prepareUploadFile(context, coverUri, false)
                     }
                 } else null
+
+                if (coverFile != null) {
+                    android.util.Log.i("UploadMedia", "Cover image cached at: ${coverFile.absolutePath}")
+                }
                 
                 val sharedPrefs = context.getSharedPreferences("wholetv_prefs", android.content.Context.MODE_PRIVATE)
                 var backendUrl = sharedPrefs.getString("backend_url", "https://wholetvss.onrender.com/api") ?: "https://wholetvss.onrender.com/api"
@@ -705,8 +773,6 @@ class MediaViewModel(private val context: android.content.Context, private val r
                 
                 val uploadId = java.util.UUID.randomUUID().toString()
                 
-                // Reset states
-                com.example.data.UploadManager.reset()
                 com.example.data.UploadManager.updateProgress(
                     isUploading = true,
                     progress = 0f,
@@ -716,7 +782,7 @@ class MediaViewModel(private val context: android.content.Context, private val r
                     remainingSize = "Calculating...",
                     eta = "Calculating...",
                     title = title,
-                    status = "Starting background worker..."
+                    status = "Enqueuing background upload worker..."
                 )
                 
                 // Build WorkManager inputs
@@ -745,10 +811,27 @@ class MediaViewModel(private val context: android.content.Context, private val r
                     .addTag("upload_work_$uploadId")
                     .build()
                 
+                android.util.Log.i("UploadMedia", "Enqueuing WorkManager task upload_work_$uploadId to $backendUrl...")
                 androidx.work.WorkManager.getInstance(context).enqueue(uploadWorkRequest)
+                android.util.Log.i("UploadMedia", "WorkManager task enqueued successfully!")
+                
                 onSuccess()
             } catch (e: Exception) {
-                onFailure(e.localizedMessage ?: "Failed to start background upload.")
+                val err = "Failed to launch background upload: ${e.localizedMessage ?: e.message}"
+                android.util.Log.e("UploadMedia", err, e)
+                com.example.data.UploadManager.updateProgress(
+                    isUploading = false,
+                    progress = 0f,
+                    speed = "0 KB/s",
+                    uploadedSize = "0 MB",
+                    totalSize = "0 MB",
+                    remainingSize = "0 MB",
+                    eta = "Error",
+                    title = title,
+                    status = "Failed",
+                    errorMsg = err
+                )
+                onFailure(err)
             }
         }
     }

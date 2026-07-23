@@ -78,21 +78,32 @@ class UploadWorker(
 
         val uploadId = inputData.getString("uploadId") ?: UUID.randomUUID().toString()
 
-        Log.i(TAG, "Starting background upload. Video: $videoPath, Cover: $coverPath, Backend: $backendUrl")
+        Log.i(TAG, "=============================================")
+        Log.i(TAG, "🚀 UPLOAD WORKER STARTED")
+        Log.i(TAG, "Video Path: $videoPath")
+        Log.i(TAG, "Cover Path: $coverPath")
+        Log.i(TAG, "Backend URL: $backendUrl")
+        Log.i(TAG, "Upload ID: $uploadId")
+        Log.i(TAG, "=============================================")
         
         // Setup foreground notification
-        setForeground(getForegroundInfo())
+        try {
+            setForeground(getForegroundInfo())
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not set foreground info: ${e.message}")
+        }
 
         val videoFile = File(videoPath)
         if (!videoFile.exists()) {
             val errorMsg = "Video file does not exist locally: $videoPath"
-            Log.e(TAG, errorMsg)
+            Log.e(TAG, "❌ [ERROR] $errorMsg")
             UploadManager.updateProgress(false, 0f, "0 KB/s", "0 MB", "0 MB", "0 MB", "Error", title, errorMsg, errorMsg)
             return Result.failure()
         }
 
         val totalSize = videoFile.length()
         val totalSizeStr = formatSize(totalSize)
+        Log.i(TAG, "Video selected & validated. File size: $totalSizeStr ($totalSize bytes)")
 
         try {
             // Step 1: Upload cover photo if present
@@ -100,6 +111,7 @@ class UploadWorker(
             coverPath?.let { path ->
                 val coverFile = File(path)
                 if (coverFile.exists()) {
+                    Log.i(TAG, "Cover image selected. Uploading cover file (${coverFile.length()} bytes)...")
                     updateNotification("Uploading cover image...", 0)
                     UploadManager.updateProgress(
                         isUploading = true,
@@ -114,8 +126,11 @@ class UploadWorker(
                     )
                     
                     val uploadedUrl = uploadFileDirectly(coverFile, backendUrl)
-                    if (uploadedUrl != null) {
+                    if (!uploadedUrl.isNullOrBlank()) {
                         finalCoverUrl = uploadedUrl
+                        Log.i(TAG, "Cover image uploaded successfully! URL: $finalCoverUrl")
+                    } else {
+                        Log.w(TAG, "Cover image upload returned null URL. Using default poster: $finalCoverUrl")
                     }
                 }
             }
@@ -130,7 +145,7 @@ class UploadWorker(
                 startByte = 0L
             }
 
-            Log.i(TAG, "Resuming chunked upload of video from byte: $startByte / $totalSize")
+            Log.i(TAG, "Starting / Resuming chunked video upload. Offset: $startByte / $totalSize bytes")
 
             val chunkSize = DEFAULT_CHUNK_SIZE
             var lastTime = System.currentTimeMillis()
@@ -142,7 +157,7 @@ class UploadWorker(
                 val endByte = minOf(startByte + chunkSize, totalSize)
                 val chunkLength = (endByte - startByte).toInt()
 
-                Log.d(TAG, "Reading chunk: $startByte-$endByte of $totalSize")
+                Log.i(TAG, "Reading video chunk: bytes $startByte-${endByte - 1}/$totalSize ($chunkLength bytes)")
                 val chunkData = readChunkBytes(videoFile, startByte, chunkLength)
 
                 // Try to upload chunk with retries
@@ -158,28 +173,34 @@ class UploadWorker(
                         val percent = (progressFloat * 100).toInt()
                         updateNotification("Uploading video ($percent%)...", percent)
 
+                        Log.i(TAG, "Sending API request for chunk attempt $attempt/3: $contentRange to $backendUrl")
                         // Upload the chunk
                         val responseJson = uploadChunk(
                             chunkBytes = chunkData,
                             uploadId = uploadId,
                             contentRange = contentRange,
-                            backendUrl = backendUrl
+                            backendUrl = backendUrl,
+                            fileOriginalName = videoFile.name
                         )
 
                         if (responseJson != null) {
                             chunkUploaded = true
+                            Log.i(TAG, "Chunk uploaded successfully! Response: $responseJson")
                             
-                            // If this was the last chunk, extract final video URL
-                            if (endByte >= totalSize) {
-                                currentVideoUrl = responseJson.optString("secure_url", null)
-                                    ?: responseJson.optString("url", null)
+                            // If this response contains a secure_url or url, save it
+                            val returnedUrl = responseJson.optString("secure_url", null)
+                                ?: responseJson.optString("url", null)
+                            if (!returnedUrl.isNullOrBlank()) {
+                                currentVideoUrl = returnedUrl
+                                Log.i(TAG, "Received secure_url from Cloudinary / Backend: $currentVideoUrl")
                             }
                         } else {
                             attempt++
-                            TimeUnit.SECONDS.sleep(2) // Wait 2s before retry
+                            Log.w(TAG, "Chunk response was null. Retrying attempt $attempt/3...")
+                            TimeUnit.SECONDS.sleep(2)
                         }
                     } catch (e: Exception) {
-                        Log.e(TAG, "Chunk upload failed on attempt $attempt", e)
+                        Log.e(TAG, "Chunk upload failed on attempt $attempt/3: ${e.message}", e)
                         lastErr = e
                         attempt++
                         TimeUnit.SECONDS.sleep(3) // Wait 3s before retry
@@ -187,7 +208,9 @@ class UploadWorker(
                 }
 
                 if (!chunkUploaded) {
-                    throw lastErr ?: Exception("Chunk upload failed after 3 attempts.")
+                    val finalEx = lastErr ?: Exception("Chunk upload failed after 3 attempts.")
+                    Log.e(TAG, "❌ [FATAL] Video chunk upload failed permanently: ${finalEx.message}", finalEx)
+                    throw finalEx
                 }
 
                 // Chunk upload success! Update startByte and persist it
@@ -219,7 +242,7 @@ class UploadWorker(
                         remainingSize = remainingSizeStr,
                         eta = etaStr,
                         title = title,
-                        status = "Uploading video chunk..."
+                        status = "Uploading video chunk (${(totalProgress * 100).toInt()}%)..."
                     )
 
                     lastTime = now
@@ -228,11 +251,15 @@ class UploadWorker(
             }
 
             if (currentVideoUrl.isNullOrBlank()) {
-                currentVideoUrl = "https://www.w3schools.com/html/mov_bbb.mp4" // Safety fallback
+                val err = "Backend upload finished but Cloudinary/Backend did not return a valid secure_url."
+                Log.e(TAG, "❌ [ERROR] $err")
+                throw Exception(err)
             }
 
+            Log.i(TAG, "✅ Video upload finished successfully! Final secure_url: $currentVideoUrl")
+
             // Step 3: Insert item into local Room Database
-            Log.i(TAG, "Successfully uploaded everything. Saving to DB! VideoUrl: $currentVideoUrl, CoverUrl: $finalCoverUrl")
+            Log.i(TAG, "Saving video metadata to local Room Database...")
             val database = AppDatabase.getDatabase(applicationContext)
             val repository = MediaRepository(database.mediaDao())
 
@@ -254,17 +281,19 @@ class UploadWorker(
                 genre = genre,
                 uploaderName = uploaderName,
                 uploaderId = currentUserId,
-                firestoreId = "user_uploaded",
+                firestoreId = "user_uploaded_${UUID.randomUUID()}",
                 timestamp = System.currentTimeMillis()
             )
 
             repository.insertMediaItem(finalItem)
+            Log.i(TAG, "✅ Metadata saved to Room Database successfully! Item ID: ${finalItem.id}, Title: ${finalItem.title}")
 
             // Cleanup local temp files to save space
             try {
                 videoFile.delete()
                 coverPath?.let { File(it).delete() }
                 prefs.edit().remove(savedStartByteKey).apply()
+                Log.i(TAG, "Temporary local upload files cleaned up.")
             } catch (e: Exception) {
                 Log.e(TAG, "Error cleaning up temporary files", e)
             }
@@ -283,13 +312,13 @@ class UploadWorker(
                 status = "Completed"
             )
             
-            // Clean up states
-            UploadManager.reset()
+            Log.i(TAG, "🎉 UPLOAD WORKER COMPLETED SUCCESSFULLY!")
 
             return Result.success(workDataOf("videoUrl" to currentVideoUrl, "coverUrl" to finalCoverUrl))
 
         } catch (e: Exception) {
-            Log.e(TAG, "Upload system execution crashed", e)
+            Log.e(TAG, "❌ [FATAL ERROR] Upload system execution failed: ${e.message}", e)
+            val fullError = "${e.javaClass.simpleName}: ${e.localizedMessage ?: e.message}"
             updateNotification("Upload Failed ❌", 0)
             UploadManager.updateProgress(
                 isUploading = false,
@@ -301,7 +330,7 @@ class UploadWorker(
                 eta = "Error",
                 title = title,
                 status = "Failed",
-                errorMsg = e.localizedMessage ?: "Network request failed"
+                errorMsg = fullError
             )
             return Result.failure()
         }
@@ -317,18 +346,37 @@ class UploadWorker(
     }
 
     private fun uploadFileDirectly(file: File, backendUrl: String): String? {
-        val requestBody = RequestBody.create("image/jpeg".toMediaTypeOrNull(), file)
-        
-        val request = Request.Builder()
-            .url("$backendUrl/upload")
-            .post(requestBody)
+        Log.i(TAG, "Uploading cover photo directly to $backendUrl/upload")
+        val fileRequestBody = RequestBody.create("image/*".toMediaTypeOrNull(), file)
+        val multipartBody = MultipartBody.Builder()
+            .setType(MultipartBody.FORM)
+            .addFormDataPart("file", file.name, fileRequestBody)
+            .addFormDataPart("image", file.name, fileRequestBody)
             .build()
 
-        client.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) return null
-            val bodyStr = response.body?.string() ?: return null
-            val json = JSONObject(bodyStr)
-            return json.optString("secure_url", null) ?: json.optString("url", null)
+        val request = Request.Builder()
+            .url("$backendUrl/upload")
+            .post(multipartBody)
+            .build()
+
+        return try {
+            client.newCall(request).execute().use { response ->
+                val code = response.code
+                val bodyStr = response.body?.string() ?: ""
+                Log.i(TAG, "Cover upload response: HTTP $code - $bodyStr")
+                if (!response.isSuccessful) {
+                    Log.e(TAG, "Cover upload failed with HTTP $code: $bodyStr")
+                    null
+                } else {
+                    val json = JSONObject(bodyStr)
+                    val url = json.optString("secure_url", null) ?: json.optString("url", null)
+                    Log.i(TAG, "Cover upload secure_url received: $url")
+                    url
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Cover upload exception: ${e.message}", e)
+            null
         }
     }
 
@@ -336,23 +384,64 @@ class UploadWorker(
         chunkBytes: ByteArray,
         uploadId: String,
         contentRange: String,
-        backendUrl: String
+        backendUrl: String,
+        fileOriginalName: String
     ): JSONObject? {
-        val requestBody = RequestBody.create("application/octet-stream".toMediaTypeOrNull(), chunkBytes)
+        Log.i(TAG, "Sending chunk to $backendUrl/upload-chunk (Upload-ID: $uploadId, Content-Range: $contentRange)")
+        val mediaType = "application/octet-stream".toMediaTypeOrNull()
+        val rawRequestBody = RequestBody.create(mediaType, chunkBytes)
         
         val request = Request.Builder()
             .url("$backendUrl/upload-chunk")
             .header("X-Unique-Upload-Id", uploadId)
             .header("Content-Range", contentRange)
-            .post(requestBody)
+            .post(rawRequestBody)
             .build()
 
-        client.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) {
-                Log.e(TAG, "Chunk request failed with status: ${response.code}, body: ${response.body?.string()}")
-                return null
+        try {
+            client.newCall(request).execute().use { response ->
+                val code = response.code
+                val bodyStr = response.body?.string() ?: ""
+                Log.i(TAG, "Backend response code: HTTP $code, body: $bodyStr")
+
+                if (response.isSuccessful) {
+                    return JSONObject(bodyStr)
+                } else if (code != 404) {
+                    val errorMsg = "HTTP $code: $bodyStr"
+                    Log.e(TAG, "Backend API error on /upload-chunk: $errorMsg")
+                    throw java.io.IOException(errorMsg)
+                }
             }
-            val bodyStr = response.body?.string() ?: return null
+        } catch (e: java.io.IOException) {
+            if (e.message?.contains("404") != true) throw e
+        }
+
+        // Fallback to multipart /upload endpoint if /upload-chunk is 404
+        Log.i(TAG, "/upload-chunk returned 404. Falling back to multipart $backendUrl/upload")
+        val multipartBody = MultipartBody.Builder()
+            .setType(MultipartBody.FORM)
+            .addFormDataPart("file", fileOriginalName, rawRequestBody)
+            .addFormDataPart("video", fileOriginalName, rawRequestBody)
+            .build()
+
+        val fallbackRequest = Request.Builder()
+            .url("$backendUrl/upload")
+            .header("X-Unique-Upload-Id", uploadId)
+            .header("Content-Range", contentRange)
+            .post(multipartBody)
+            .build()
+
+        client.newCall(fallbackRequest).execute().use { response ->
+            val code = response.code
+            val bodyStr = response.body?.string() ?: ""
+            Log.i(TAG, "Fallback /upload response code: HTTP $code, body: $bodyStr")
+
+            if (!response.isSuccessful) {
+                val errorMsg = "HTTP $code: $bodyStr"
+                Log.e(TAG, "Backend API error on /upload: $errorMsg")
+                throw java.io.IOException(errorMsg)
+            }
+
             return JSONObject(bodyStr)
         }
     }
